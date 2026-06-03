@@ -3,3 +3,6 @@
 .idea/
 __pycache__/
 *.pyc
+/versions.md
+/record.md
+/.venv/
