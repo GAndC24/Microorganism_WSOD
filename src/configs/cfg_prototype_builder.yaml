@@ -9,6 +9,7 @@ DATA:
   NUM_CLASSES: 7
 
 MODEL:
+  MODEL_NAME: "PrototypeBuilder"
   EMBED_DIM: 512
   HIDDEN_DIM: 4096  # (512, 1024, 2048, 4096)
   LAYER_INDICES: [8, 22, 29]  # [low, mid, high]
@@ -19,3 +20,17 @@ MODEL:
   # for RoI Align
   ROI_OUT_SIZE_MID: 21   # 14 or 21, should be divisible by PATCH_SIZE
   SAMPLING_RATIO: 2
+
+TRAINER:
+  EPOCHS: 50
+  LR: 0.001
+  WARM_UP_LR_FACTOR: 0.01    # min_lr = warm_up_lr_factor * lr
+  WARMUP_EPOCHS: 5    # 1/10 epochs
+  WEIGHT_DECAY: 0.05    # [0.05, 0.1]
+  MODEL_SAVE_PATH: "results/model_weights/"
+  DATASET_MPS_SAVE_PATH: "results/dataset_morphological_prototypes/"
+  CONTINUE_TRAIN: false
+  CHECKPOINT_PATH: ""  # logs/{model_name}_train_log_{start_time}/{model_name}_checkpoints/checkpoint_{epoch}.pth
+  W_CAM_LOSS: 0.8   # [0.1, 1.0]
+  W_PATCH_LOSS: 1.0   # [0.1, 1.0]
+  MP_EMA_ALPHA: 0.99   # [0.9, 0.99]
