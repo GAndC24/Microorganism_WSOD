@@ -11,7 +11,7 @@ import fvcore.nn.weight_init as weight_init
 import numpy as np
 from torchvision.models import vgg16
 
-from configs.cfg_prototype_builder import PrototypeBuilderConfig, build_prototype_builder_config
+from .configs.cfg_prototype_builder import PrototypeBuilderConfig, build_prototype_builder_config
 
 
 # -----Feature Hook-----
@@ -421,7 +421,7 @@ class ProtypeBuilder(nn.Module):
         return out
 
 
-def build_prototype_builder_mode(
+def build_prototype_builder_model(
     cfg: Dict      # global configuration
 )-> ProtypeBuilder:
     # init backbone and hook

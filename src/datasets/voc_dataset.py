@@ -1,42 +1,93 @@
-import json
+# Pascal VOC Style Dataset
 import os
 from typing import Callable, Dict, List, Optional, Tuple, Any
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from PIL import Image
-from utils import *
 from torchvision import tv_tensors
 
-def detection_collate_fn(batch : List)-> Tuple[List[torch.Tensor], List[Dict[str, Any]]]:
+from .utils.data_catalog import DataCatalog
+from .utils.annotation_process import parse_voc_xml
+
+
+Box = Tuple[float, float, float, float]   # (x1, y1, x2, y2)
+
+
+def _detection_collate_fn(batch : List)-> Tuple[List[torch.Tensor], List[Dict[str, Any]]]:
     '''batch : List of (image, target)'''
     images, targets = zip(*batch)
     return list(images), list(targets)
+
+
+def _clip_and_filter_labeled_boxes(
+    labeled_boxes: List[Dict[str, Any]],
+    width: int,
+    height: int,
+) -> Tuple[List[Box], List[int]]:
+    """裁剪标注框并过滤非有限值或零面积框。"""
+    boxes: List[Box] = []
+    labels: List[int] = []
+
+    for item in labeled_boxes:
+        x1, y1, x2, y2 = item["box"]
+        coords = torch.tensor([x1, y1, x2, y2], dtype=torch.float32)
+        if not torch.isfinite(coords).all():
+            continue
+
+        x1 = float(max(0.0, min(float(width), float(x1))))
+        y1 = float(max(0.0, min(float(height), float(y1))))
+        x2 = float(max(0.0, min(float(width), float(x2))))
+        y2 = float(max(0.0, min(float(height), float(y2))))
+
+        x_min = min(x1, x2)
+        y_min = min(y1, y2)
+        x_max = max(x1, x2)
+        y_max = max(y1, y2)
+        if x_max <= x_min or y_max <= y_min:
+            continue
+
+        boxes.append((x_min, y_min, x_max, y_max))
+        labels.append(int(item["class_id"]))
+
+    return boxes, labels
+
 
 class VocDataset(Dataset):
     def __init__(
         self,
         dataset_name: str,      # dataset name
         split: str,       # dataset split, "train" or "val" or "test"
+        target_mode: str,    # target mode, "gt" or "wb"
         transforms: Optional[Callable] = None,      # data transforms
     )-> None:
         super().__init__()
 
-        self.root = os.path.expanduser(root)
-        self.split = split
+        data_catalog = DataCatalog()
+        self.dataset_info = data_catalog.get(dataset_name)
+
         self.transforms = transforms
 
-        self.ann_wb_dir = os.path.join(self.root, "Annotations_wb")  # wb xml annotation folder
-        if split == "train":    # for train, use pseudo labels as GT
-            self.ann_gt_dir = os.path.join(self.root, "Annotations_pl_processed")  # pl xml annotation folder
+        # get annotation directory
+        if target_mode == "wb":
+            ann_path = self.dataset_info["ann_dir_wb"]
         else:
-            self.ann_gt_dir = os.path.join(self.root, "Annotations_gt")  # gt xml annotation folder
-        # self.ann_gt_dir = os.path.join(self.root, "Annotations_gt")  # gt xml annotation folder
-        self.ann_sam3_dir = os.path.join(self.root, "Annotations_sam3")  # sam3 xml annotation folder
-        self.img_dir = os.path.join(self.root, "JPEGImages")  # jpg images folder
-        self.set_dir = os.path.join(self.root, "ImageSets", "Main")  # dataset split folder
+            ann_path = self.dataset_info["ann_dir_gt"]
+        self.ann_dir = ann_path
+
+        # get ImageSet directory
+        if split == "train":
+            set_dir_path = self.dataset_info["train_split"]
+        elif split == "val":
+            set_dir_path = self.dataset_info["val_split"]
+        else:
+            set_dir_path = self.dataset_info["test_split"]
+        self.set_dir = set_dir_path  # dataset split folder
+
+        # get image directory
+        self.img_dir = self.dataset_info["img_dir"]  # jpg images folder
 
         # load images
-        imageset_txt = os.path.join(self.set_dir, f"{split}.txt")
+        imageset_txt = self.set_dir
         if not os.path.isfile(imageset_txt):
             raise FileNotFoundError(f"ImageSet file not found: {imageset_txt}")
         with open(imageset_txt, "r", encoding="utf-8") as f:
@@ -51,73 +102,54 @@ class VocDataset(Dataset):
         image_id = self.img_ids[idx]
 
         img_path = os.path.join(self.img_dir, f"{image_id}.jpg")
-        wb_xml_path = os.path.join(self.ann_wb_dir, f"{image_id}.xml")
-        gt_xml_path = os.path.join(self.ann_gt_dir, f"{image_id}.xml")
-        # sam3_xml_path = os.path.join(self.ann_sam3_dir, f"{image_id}.xml")
+        xml_path = os.path.join(self.ann_dir, f"{image_id}.xml")
 
         if not os.path.isfile(img_path):
             raise FileNotFoundError(f"Image not found: {img_path}")
-        if not os.path.isfile(wb_xml_path):
-            raise FileNotFoundError(f"Annotation not found: {wb_xml_path}")
-        if not os.path.isfile(gt_xml_path):
-            raise FileNotFoundError(f"Annotation not found: {gt_xml_path}")
-        # if not os.path.isfile(sam3_xml_path):
-        #     raise FileNotFoundError(f"Annotation not found: {sam3_xml_path}")
+        if not os.path.isfile(xml_path):
+            raise FileNotFoundError(f"Annotation not found: {xml_path}")
 
         image_pil = Image.open(img_path).convert("RGB")
         W, H = image_pil.size  # PIL: (W, H)
 
-        image_info, wbs = parse_voc_xml(wb_xml_path, class_map_encoding)
-        _, gts = parse_voc_xml(gt_xml_path, class_map_encoding)
-        # _, sam3s = parse_voc_xml_sam3(sam3_xml_path, class_map_encoding)
+        image_info, ann_boxes = parse_voc_xml(xml_path, self.dataset_info["class_map_encoding"])
 
-        boxes, labels = _clip_and_filter_labeled_boxes(wbs, W, H)
-        gt_boxes, gt_labels = _clip_and_filter_labeled_boxes(gts, W, H)
-        # sam3_boxes : List[Box] = []
-        # sam3_scores : List[float] = []
-        # for sam3 in sam3s:
-        #     sam3_boxes.append(sam3['box'])
-        #     sam3_scores.append(sam3['score'])
+        ann_boxes, labels = _clip_and_filter_labeled_boxes(ann_boxes, W, H)
 
-        # if len(sam3_boxes) == 0:
-        #     raise RuntimeError(
-        #         f"Empty sam3_boxes for image_id={image_id}, annotation file: {sam3_xml_path}"
-        #     )
-
-        boxes_tensor = _boxes_to_tensor(boxes)  # [N,4]
+        ann_boxes_tensor = torch.tensor(ann_boxes, dtype=torch.float32)  # [N,4]
         labels_tensor = torch.tensor(labels, dtype=torch.int64)  # [N]
-        gt_boxes_tensor = _boxes_to_tensor(gt_boxes)   # [N,4]
-        gt_labels_tensor = torch.tensor(gt_labels, dtype=torch.int64)   # [N]
-        # sam3_boxes_tensor = torch.tensor(sam3_boxes, dtype=torch.float32)
-        # sam3_scores_tensor = torch.tensor(sam3_scores, dtype=torch.float32)
 
         image = tv_tensors.Image(image_pil)
-        boxes_tv = tv_tensors.BoundingBoxes(
-            boxes_tensor,
+        ann_boxes_tv = tv_tensors.BoundingBoxes(
+            ann_boxes_tensor,
             format="XYXY",
             canvas_size=(H, W)
         )
-        gt_boxes_tv = tv_tensors.BoundingBoxes(
-            gt_boxes_tensor,
-            format="XYXY",
-            canvas_size=(H, W)
-        )
-        # sam3_boxes_tv = tv_tensors.BoundingBoxes(
-        #     sam3_boxes_tensor,
-        #     format="XYXY",
-        #     canvas_size=(H, W)
-        # )
+
         target: Dict[str, Any] = {
-            "boxes": boxes_tv,
+            "boxes": ann_boxes_tv,
             "labels": labels_tensor,
-            "gt_boxes": gt_boxes_tv,
-            "gt_labels": gt_labels_tensor,
-            # "sam3_boxes": sam3_boxes_tv,
-            # "sam3_scores": sam3_scores_tensor,
-            # "image_id": torch.tensor([self.train_encoding[image_id]], dtype=torch.int64),
         }
 
         if self.transforms is not None:
             image, target = self.transforms(image, target)
 
         return image, target
+
+
+def build_voc_dataloader(
+    dataset_name: str,      # dataset name
+    split: str,       # dataset split, "train" or "val" or "test"
+    target_mode: str,    # target mode, "gt" or "wb"
+    batch_size: int,
+    transforms: Optional[Callable] = None,      # data transforms
+)->DataLoader:
+    dataset = VocDataset(dataset_name, split, target_mode, transforms=transforms)
+
+    if split == "train":
+        shuffle = True
+    else:
+        shuffle = False
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=4, pin_memory=True, collate_fn=_detection_collate_fn)
+
+    return dataloader

@@ -7,7 +7,25 @@
         "ann_dir_wb": "Urinary Sediment Dataset/Annotations_wb/",
         "train_split": "Urinary Sediment Dataset/ImageSets/Main/train.txt",
         "val_split": "Urinary Sediment Dataset/ImageSets/Main/val.txt",
-        "test_split": "Urinary Sediment Dataset/ImageSets/Main/test.txt"
+        "test_split": "Urinary Sediment Dataset/ImageSets/Main/test.txt",
+        "class_map_encoding" : {
+            "cast" : 0,
+            "cryst": 1,
+            "epith" : 2,
+            "epithn" : 3,
+            "eryth" : 4,
+            "leuko" : 5,
+            "mycete" : 6
+        },
+        "class_map_decoding" : {
+            "0" : "cast",
+            "1" : "cryst",
+            "2" : "epith",
+            "3" : "epithn",
+            "4" : "eryth",
+            "5" : "leuko",
+            "6" : "mycete"
+        }
     }
   }
 }

@@ -6,7 +6,7 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from tqdm.auto import tqdm
 from typing import Dict, List
 
-from configs.cfg_trainer_prototype_builder import PrototypeBuilderTrainerConfig, build_prototype_builder_trainer_config
+from .configs.cfg_trainer_prototype_builder import PrototypeBuilderTrainerConfig, build_prototype_builder_trainer_config
 from ..losses.loss_funcs import get_patch_cls_loss
 from ..losses.supcon_loss import SupConLossConfig, LossContrastMode, supervised_contrastive_loss
 

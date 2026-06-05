@@ -3,9 +3,9 @@ RUNTIME:
   DEVICE: "cuda"  # 'cuda' or 'cpu'
 
 DATA:
-  DATA_ROOT: "data/processed/Urinary Sediment Dataset"
+  DATASET_NAME: "voc_urinary_sediment"
   BATCH_SIZE: 8
-  IMG_SIZE: 1000
+  IMG_SIZE: 640
   NUM_CLASSES: 7
 
 MODEL:
@@ -16,6 +16,7 @@ MODEL:
   PATCH_SIZE: 3   # 2 or 3
   # for GMM in Morphological Prototype Generator
   COMPONENTS_RANGE: [2, 3, 4]
+  RANDOM_STATE: 42
   MAX_ITER: 20
   # for RoI Align
   ROI_OUT_SIZE_MID: 21   # 14 or 21, should be divisible by PATCH_SIZE
