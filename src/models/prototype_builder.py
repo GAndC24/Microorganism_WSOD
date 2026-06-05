@@ -264,7 +264,7 @@ class MorphologicalPrototypeGenerator(nn.Module):
         weights : torch.Tensor,    # [R, Np]
         wb_labels : torch.Tensor,       # [R, num_classes]
         eps: float = 1e-6,
-        normalize_proto: bool = True
+        normalize_proto: bool = False
     )-> Dict[int, torch.Tensor]:
         """
         :return: prototypes, {class_id: prototype tensor}
@@ -397,7 +397,7 @@ class ProtypeBuilder(nn.Module):
         out: Dict[str, Any], contains:
         - loss_cam: Tensor, CAM loss
         - prototypes: Dict[int, Tensor], {class_id, prototype_embeddings_raw}
-        - patch_logits: Tensor, shape [R * k, D], k=num_patches
+        - patch_logits: Tensor, shape [R * k, D], k=num_patches_per_wb
         - contrast_patch_features: Tensor, patch features for SupCon, shape [R, view=1, D]
         """
         out : Dict[str, Any] = {}   # output
@@ -419,3 +419,30 @@ class ProtypeBuilder(nn.Module):
         })
 
         return out
+
+
+def build_prototype_builder_mode(
+    cfg: Dict      # global configuration
+)-> ProtypeBuilder:
+    # init backbone and hook
+    backbone, hook = build_vgg16_backbone_with_hook(cfg['MODEL']['LAYER_INDICES'])
+
+    # build model config
+    model_cfg = build_prototype_builder_config(cfg)
+
+    # init mp_generator
+    mp_generator = MorphologicalPrototypeGenerator(
+        num_classes=cfg['DATA']['NUM_CLASSES'],
+        in_c=model_cfg.in_c,
+        patch_size=model_cfg.patch_size,
+        embed_dim=model_cfg.embed_dim,
+        components_range=model_cfg.components_range,
+        random_state=model_cfg.random_state,
+        max_iter=model_cfg.max_iter,
+        roi_out_size=model_cfg.roi_out_size_mid,
+        spatial_scale=model_cfg.spatial_scale_mid,
+        sampling_ratio=model_cfg.sampling_ratio
+    )
+
+    return ProtypeBuilder(backbone, hook, mp_generator, model_cfg)
+

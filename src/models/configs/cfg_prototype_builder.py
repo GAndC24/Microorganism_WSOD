@@ -4,6 +4,7 @@ from typing import Tuple, List, Dict
 
 from ...utils.vgg_layer_maps import vgg_layer_out_c_maps, vgg_layer_out_size_ratio_maps
 
+
 @dataclass
 class PrototypeBuilderConfig:
     embed_dim: int  # embedding dimension

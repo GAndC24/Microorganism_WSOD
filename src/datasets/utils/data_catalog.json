@@ -1,0 +1,13 @@
+{
+  "DATA_ROOT": "data/processed/",
+  "DATASETS": {
+    "voc_urinary_sediment": {
+        "img_dir": "Urinary Sediment Dataset/JPEGImages/",
+        "ann_dir_gt": "Urinary Sediment Dataset/Annotations_gt/",
+        "ann_dir_wb": "Urinary Sediment Dataset/Annotations_wb/",
+        "train_split": "Urinary Sediment Dataset/ImageSets/Main/train.txt",
+        "val_split": "Urinary Sediment Dataset/ImageSets/Main/val.txt",
+        "test_split": "Urinary Sediment Dataset/ImageSets/Main/test.txt"
+    }
+  }
+}
