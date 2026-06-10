@@ -4,8 +4,8 @@ RUNTIME:
 
 DATA:
   DATASET_NAME: "voc_urinary_sediment"
-  BATCH_SIZE: 8
-  IMG_SIZE: 640
+  BATCH_SIZE: 32
+  IMG_SIZE: 384
   NUM_CLASSES: 7
 
 MODEL:
@@ -23,15 +23,16 @@ MODEL:
   SAMPLING_RATIO: 2
 
 TRAINER:
-  EPOCHS: 50
+  EPOCHS: 40
   LR: 0.001
   WARM_UP_LR_FACTOR: 0.01    # min_lr = warm_up_lr_factor * lr
-  WARMUP_EPOCHS: 5    # 1/10 epochs
+  WARMUP_EPOCHS: 4    # 1/10 epochs
   WEIGHT_DECAY: 0.05    # [0.05, 0.1]
   MODEL_SAVE_PATH: "results/model_weights/"
   DATASET_MPS_SAVE_PATH: "results/dataset_morphological_prototypes/"
   CONTINUE_TRAIN: false
-  CHECKPOINT_PATH: ""  # logs/{model_name}_train_log_{start_time}/{model_name}_checkpoints/checkpoint_{epoch}.pth
+  # logs/{model_name}_train_log_{start_time}/{model_name}_checkpoints/checkpoint_{epoch}
+  CHECKPOINT_PATH: ""
   W_CAM_LOSS: 0.8   # [0.1, 1.0]
   W_PATCH_LOSS: 1.0   # [0.1, 1.0]
   MP_EMA_ALPHA: 0.99   # [0.9, 0.99]

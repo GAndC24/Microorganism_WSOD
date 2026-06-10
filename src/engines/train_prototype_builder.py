@@ -33,8 +33,9 @@ def train(
 
     # -----Init Dataloader-----
     # data preprocessing transforms
+    img_size = cfg['DATA']["IMG_SIZE"]
     transform_aug = T.Compose([
-        T.Resize(cfg["DATA"]['IMG_SIZE']),
+        T.Resize((img_size, img_size)),
         T.ToImage(),
         T.ToDtype(torch.float32, scale=True),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
