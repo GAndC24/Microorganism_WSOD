@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "fvcore>=0.1.5.post20221221",
+    "matplotlib==3.10.7",
     "scikit-learn==1.8.0",
     "timm==1.0.22",
     "torch==2.5.1+cu124",
