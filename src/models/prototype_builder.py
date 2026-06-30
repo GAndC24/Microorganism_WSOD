@@ -6,10 +6,9 @@ import torch.nn.functional as F
 from typing import Dict, List, Tuple, Any
 from torchvision.ops import RoIAlign
 from timm.models.vision_transformer import PatchEmbed
-from sklearn.mixture import GaussianMixture
 import fvcore.nn.weight_init as weight_init
-import numpy as np
 from torchvision.models import vgg16
+from torchvision.transforms import v2 as T
 
 from .configs.cfg_prototype_builder import PrototypeBuilderConfig, build_prototype_builder_config
 
@@ -114,6 +113,56 @@ class CAMHead(nn.Module):
         return x, loss_cam
 
 
+# -----Feature Augmentation Transform-----
+class FeatureMapTransform(nn.Module):
+    def __init__(
+        self,
+        num_views: int = 2,
+        mask_prob: float = 0.5,
+        mask_scale: Tuple[float, float] = (0.02, 0.20),
+        noise_prob: float = 0.5,
+        noise_sigma: float = 0.05,
+        keep_original: bool = True,
+    ) -> None:
+        super().__init__()
+        self.num_views = num_views
+        self.keep_original = keep_original
+
+        self.transform = T.Compose([
+            T.RandomErasing(
+                p=mask_prob,
+                scale=mask_scale,
+                ratio=(0.3, 3.3),
+                value=0.0,
+                inplace=False,
+            ),
+            T.RandomApply([
+                T.GaussianNoise(
+                    mean=0.0,
+                    sigma=noise_sigma,
+                    clip=False,
+                )
+            ], p=noise_prob),
+        ])
+
+    def forward(
+        self,
+        x: torch.Tensor     # shape [R=num_wbs, C, H, W]
+    )->torch.Tensor:
+        '''
+        :return: shape [R, V=num_views, C, H, W]
+        '''
+        views = []
+
+        if self.keep_original:
+            views.append(x)
+
+        while len(views) < self.num_views:
+            views.append(self.transform(x))
+
+        return torch.stack(views, dim=1)
+
+
 # -----Morphological Prototype Generator-----
 # use GMM for anchor
 class MorphologicalPrototypeGenerator(nn.Module):
@@ -124,10 +173,6 @@ class MorphologicalPrototypeGenerator(nn.Module):
         # Patch Embed parameters
         patch_size : int,       # patch size
         embed_dim: int,  # embedding dimension
-        # GMM parameters
-        components_range : List,   # list of number of components for GMM
-        random_state : int,     # random state for GMM(seed)
-        max_iter : int,     # max iteration for EM
         # RoI Align parameters
         roi_out_size: Tuple[int, int],  # output size
         spatial_scale : float = 1/16,  # spatial scale
@@ -141,9 +186,6 @@ class MorphologicalPrototypeGenerator(nn.Module):
         self.embed_dim = embed_dim
         self.num_prototypes = num_classes
         self.patch_size = patch_size
-        self.components_range = components_range
-        self.random_state = random_state
-        self.max_iter = max_iter
 
         self.roi_align = RoIAlign(
             output_size=roi_out_size,
@@ -164,18 +206,17 @@ class MorphologicalPrototypeGenerator(nn.Module):
             embed_dim=embed_dim,
         )
 
-        self.cls_head = nn.Linear(embed_dim, num_classes)
-        self.cls_head.apply(self._init_weights)
+        self.feature_transform = FeatureMapTransform(
+            num_views=2,
+            mask_prob=0.5,
+            mask_scale=(0.02, 0.20),
+            noise_prob=0.5,
+            noise_sigma=0.05,
+            keep_original=True,
+        )
 
-    def _init_weights(self, m)->None:
-        """
-        Initialize weights for Linear and BatchNorm layers.
-        :param m: Module to initialize
-        """
-        if isinstance(m, nn.Linear):  # Check if the module is a Linear layer
-            torch.nn.init.xavier_uniform_(m.weight)  # Xavier initialization for weights
-            if m.bias is not None:  # Initialize bias to zero if it exists
-                nn.init.constant_(m.bias, 0)
+        self.gap_bg = nn.AdaptiveAvgPool2d((1, 1))
+
 
     def _cam_to_patch_fg_bg_scores(self, cams : torch.Tensor,wb_labels : torch.Tensor)-> torch.Tensor:
         """
@@ -208,55 +249,30 @@ class MorphologicalPrototypeGenerator(nn.Module):
 
         return patch_fg_bg_scores
 
-    def _get_anchor_features(self, patch_features : torch.Tensor, patch_fg_bg_scores : torch.Tensor)->torch.Tensor:
+
+    def _get_anchor_features(
+        self,
+        patch_features : torch.Tensor,      # [Np, D]
+        patch_fg_bg_scores : torch.Tensor,  # [Np, 2]
+        lse_alpha: float = 10.0,
+    )->torch.Tensor:
         """
-        :param patch_features: for each weak box, [Np, D]
-        :param patch_fg_bg_scores: for each weak box, [Np, 2]
         :return: anchor_feature: the anchor feature of weak box, [D]
         """
-        x = patch_features.cpu().detach().numpy()
+        eps = 1e-6
+        alpha = float(lse_alpha)
 
-        # Norm x
-        x = x / np.linalg.norm(x, axis=1, keepdims=True)
+        patch_features_norm = F.normalize(patch_features, dim=-1, eps=eps)
 
-        # Use BIC to select number of components
-        bic_scores : List = []
-        for k in self.components_range:
-            gmm = GaussianMixture(
-                n_components=k,
-                covariance_type='full',
-                init_params='kmeans',  # K-means 鍒濆鍖?
-                random_state=self.random_state,
-                max_iter=self.max_iter
-            )
-            gmm.fit(x)
-            bic_scores.append(gmm.bic(x))
+        fg_scores = patch_fg_bg_scores[:, 0].clamp_min(eps)
+        fg_weights = fg_scores / (fg_scores.sum(dim=0, keepdim=True) + eps)
 
-        best_k = self.components_range[bic_scores.index(min(bic_scores))]
+        weighted_logits = alpha * patch_features_norm + torch.log(fg_weights).unsqueeze(-1)
+        anchor_feature = torch.logsumexp(weighted_logits, dim=0) / alpha
+        anchor_feature = F.normalize(anchor_feature, dim=-1, eps=eps)
 
-        # GMM clustering
-        gmm = GaussianMixture(
-            n_components=best_k,
-            covariance_type='full',
-            init_params='kmeans',
-            random_state=self.random_state,
-            max_iter=self.max_iter
-        )
-        gmm.fit(x)
+        return anchor_feature
 
-        # get responsibility of each component
-        responsibilities = gmm.predict_proba(x)     # [Np, best_k]
-
-        # get fg scores for each component
-        obj_scores = patch_fg_bg_scores[:, 0].cpu().detach().numpy()  # [Np, ]
-        obj_scores = obj_scores.reshape(-1, 1)  # [Np, 1]
-        fg_scores = (responsibilities * obj_scores).sum(axis=0)
-
-        # select the component with highest fg score as anchor
-        idx = np.argmax(fg_scores)
-        anchor_feature = gmm.means_[idx]  # [D]
-
-        return torch.Tensor(anchor_feature).to(patch_features.device)
 
     def _get_morphological_prototypes(
         self,
@@ -267,7 +283,7 @@ class MorphologicalPrototypeGenerator(nn.Module):
         normalize_proto: bool = False
     )-> Dict[int, torch.Tensor]:
         """
-        :return: prototypes, {class_id: prototype tensor}
+        :return: prototypes, {class_id in [1, num_classes]: prototype tensor}
         """
         y_ = wb_labels[:, :, None, None]  # [R, num_classes, 1, 1]
         w_ = weights[:, None, :, None]  # [R, 1, Np, 1]
@@ -278,11 +294,11 @@ class MorphologicalPrototypeGenerator(nn.Module):
 
         prototypes = numerator / (denom + eps)  # [num_classes, D]
         if normalize_proto:
-            prototypes = F.normalize(prototypes, p=2, dim=-1)
+            prototypes = F.normalize(prototypes, dim=-1)
 
         proto_dict : Dict[int, torch.Tensor] = {}
-        for class_id in range(self.num_classes):
-            proto_dict[class_id] = prototypes[class_id]
+        for class_id in range(1, self.num_classes + 1):
+            proto_dict[class_id] = prototypes[class_id - 1]
 
         return proto_dict
 
@@ -290,67 +306,99 @@ class MorphologicalPrototypeGenerator(nn.Module):
     def forward(
         self,
         x : torch.Tensor,       # middle feature maps, [B, C, H, W]
-        wboxes : torch.Tensor,    # weak boxes, [R, 5], for each box, [batch_idx, x1, y1, x2, y2]
+        wboxes : torch.Tensor,    # weak boxes, [R=num_wbs, 5], for each box, [batch_idx, x1, y1, x2, y2]
         wb_labels : torch.Tensor,    # class label for weak boxes, [R, num_classes]
+        bg_boxes : torch.Tensor,    # background boxes, [R_bg=num_bg_boxes, 5], for each box, [batch_idx, x1, y1, x2, y2]
         lse_alpha : float = 10.0    # LSE alpha
-    )-> Tuple[torch.Tensor, Dict[int, torch.Tensor], torch.Tensor, torch.Tensor]:
+    )-> Dict[str, Any]:
         """
         :return:
-        - CAM loss
-        - prototypes, {class_id: prototype tensor}
-        - patch logits, [R * Np, D]
-        - patch features for SupCon, [R, view = 1, D]
+        out, Dict[str, Any], contains:
+        - 'loss_cam': torch.Tensor, CAM loss
+        - 'prototypes': Dict[int, torch.Tensor], {class_id in [0, num_classes](0 for background) : prototype_embeddings}
+        - 'contrast_patch_features': torch.Tensor, patch features for SupCon, shape [R, V=num_views, D]
         """
-        # RoI Align to get weak box features
-        roi_features = self.roi_align(x, wboxes)       # [R = num_wboxes, C, H, W]
+        out : Dict[str, Any] = {}   # output
+        # -----get aug weak box features & background features-----
+        # aug weak box features
+        roi_features = self.roi_align(x, wboxes)       # [R, C, H, W]
+        # aug_roi_features = self.feature_transform(roi_features.detach())  # [R, V, C, H, W]
+        aug_roi_features = self.feature_transform(roi_features)  # [R, V, C, H, W]
+        # background features
+        bg_roi_features = self.roi_align(x, bg_boxes)     # [R_bg, C, H, W]
 
-        # get CAMs
-        cams, loss_cam = self.cam_head(roi_features, wb_labels)        # cams, [R, num_classes, H, W]
+        # -----get background prototype-----
+        # # GAP
+        # bg_embeddings = self.gap_bg(bg_roi_features)     # [R_bg, C, 1, 1]
+        # Patch Embed
+        bg_embeddings = self.patch_embed(bg_roi_features)   # [R_bg, Np, D]
+        # LogSumExp
+        # bg_embeddings = bg_embeddings.flatten(1)       # [R_bg, C]
+        # bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha     # [C]
+        _, _, D = bg_embeddings.shape
+        bg_embeddings = bg_embeddings.reshape(-1, D)  # [R_bg * Np, D]
+        bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha  # [D]
 
-        # patch embedding
-        roi_features_detached = roi_features.detach()
-        patch_features = self.patch_embed(roi_features_detached)     # [R, Np = num_patches, D]
-        R, Np, D = patch_features.shape
+        # -----get CAMs-----
+        R, V, C, H, W = aug_roi_features.shape
+        RV = R * V
+        expand_wb_labels = wb_labels.unsqueeze(1).expand(-1, V, -1).reshape(RV, -1)  # [R * V, num_classes]
+        aug_roi_features = aug_roi_features.reshape(RV, C, H, W)    # [R * V, C, H, W]
+        cams, loss_cam = self.cam_head(aug_roi_features, expand_wb_labels)        # cams, [R * V, num_classes, H, W]
+        out.update({
+            'loss_cam' : loss_cam,
+        })
 
-        # get fg/bg scores for each patch
-        patch_fg_bg_scores = self._cam_to_patch_fg_bg_scores(cams, wb_labels)      # [R, Np, 2], fg_scores = [:, :, 0], bg_scores = [:, :, 1]
+        # -----patch embed-----
+        patch_features = self.patch_embed(
+            aug_roi_features
+        ).view(RV, -1, self.embed_dim)     # [R * V, Np=num_patches, D]
+        _, Np, D = patch_features.shape
 
+        # -----get contrast patch features for loss_pull-----
+        # get fg & bg scores for each patch
+        patch_fg_bg_scores = self._cam_to_patch_fg_bg_scores(cams, expand_wb_labels)      # [R * V, Np, 2], fg_scores = [:, :, 0], bg_scores = [:, :, 1]
         # select top-k patches based on fg scores
         top_k_ratio = 0.25      # [0.2, 0.3]
         k = int(max(1, Np * top_k_ratio))
-        topk_fg_scores, topk_indices = torch.topk(patch_fg_bg_scores[:, :, 0], k=k, dim=1)    # [R, k]
-        patch_indices = torch.arange(R, device=x.device).unsqueeze(1).expand(-1, k)    # [R, k]
-        topk_patch_features = patch_features[patch_indices, topk_indices]    # [R, k, D]
+        topk_fg_scores, topk_indices = torch.topk(patch_fg_bg_scores[:, :, 0], k=k, dim=1)    # [R * V, k]
+        patch_indices = torch.arange(RV, device=x.device).unsqueeze(1).expand(-1, k)    # [R * V, k]
+        topk_patch_features = patch_features[patch_indices, topk_indices]    # [R * V, k, D]
+        # LogSumExp for top-k patch features
+        x_lse = lse_alpha * topk_patch_features  # [R * V, k, D]
+        contrast_patch_features = torch.logsumexp(x_lse, dim=1) / lse_alpha   # [R * V, D]
+        contrast_patch_features = contrast_patch_features.view(R, V, D)     # for SupCon format, [R, V, D]
+        out.update({
+            'contrast_patch_features' : contrast_patch_features
+        })
 
-        # get patch logits for classification
-        patch_logits = self.cls_head(topk_patch_features.reshape(R * k, D))      # [R * k, num_classes]
-
-        # LogSumExp for topk_patch_features
-        x_lse = lse_alpha * topk_patch_features  # [R, k, D]
-        contrast_patch_features = torch.logsumexp(x_lse, dim=1) / lse_alpha   # [R, D]
-        contrast_patch_features = F.normalize(contrast_patch_features, p=2, dim=-1)  # [R, D]
-        contrast_patch_features = contrast_patch_features.view(R, 1, D)     # for SupCon format, [R, view = 1, D]
-
+        # -----get morphological prototypes-----
         # get anchor feature of each weak box
         anchor_features_list : List[torch.Tensor] = []
-        for i in range(R):
+        for i in range(RV):
             patch_feature = patch_features[i]
             patch_fg_bg_score = patch_fg_bg_scores[i]
-            anchor_feature = self._get_anchor_features(patch_feature, patch_fg_bg_score)
+            anchor_feature = self._get_anchor_features(patch_feature, patch_fg_bg_score, lse_alpha=lse_alpha)
             anchor_features_list.append(anchor_feature)
-        anchor_features = torch.stack(anchor_features_list, dim=0)      # [R, D]
-
+        anchor_features = torch.stack(anchor_features_list, dim=0)      # [R * V, D]
         # compute patch weights(similarity)
-        patch_features = F.normalize(patch_features, p=2, dim=-1)
-        anchor_features = F.normalize(anchor_features, p=2, dim=-1)
-        weights = (patch_features * anchor_features.unsqueeze(1)).sum(dim=-1)  # [R, Np]
-        weights = F.relu(weights)  # ReLU, remove negative value
-        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)  # normalize to sum to 1
+        patch_features_norm = F.normalize(patch_features, dim=-1)
+        anchor_features_norm = F.normalize(anchor_features, dim=-1)
+        weights = (patch_features_norm * anchor_features_norm.unsqueeze(1)).sum(dim=-1)  # [R * V, Np]
+        weights = F.relu(weights)  # remove negative value
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)  # normalize, sum to 1
+        # prototypes: Dict[int, torch.Tensor], {class_id in [1, num_classes] : prototype tensor}
+        prototypes = self._get_morphological_prototypes(patch_features_norm, weights, expand_wb_labels)
+        prototypes = {
+            0: bg_prototype,
+            **prototypes,
+        }      # 0 for background
+        
+        out.update({
+            'prototypes' : prototypes
+        })
 
-        # get morphological prototypes
-        prototypes = self._get_morphological_prototypes(patch_features, weights, wb_labels)        # {class_id : prototype tensor}
-
-        return loss_cam, prototypes, patch_logits, contrast_patch_features
+        return out
 
 
 # -----Morphological Prototype Builder-----
@@ -367,6 +415,11 @@ class ProtypeBuilder(nn.Module):
         self.encoder = backbone
         self.hook = hook
         self.mp_generator = mp_generator
+        self.projector = nn.Sequential(
+            nn.Linear(cfg.embed_dim, cfg.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(cfg.hidden_dim, cfg.embed_dim)
+        )
         self.cfg = cfg
 
         self.apply(self._init_weights)
@@ -386,19 +439,115 @@ class ProtypeBuilder(nn.Module):
             nn.init.constant_(m.bias, 0)  # Initialize shift (beta) to 0
 
 
+    def eval_prototype(
+        self,
+        x: torch.Tensor,  # input images, [B, C, H, W]
+        boxes: torch.Tensor,  # GT boxes for RoI Align, [R=num_gt_boxes, 5], for each box, [batch_idx, x1, y1, x2, y2]
+        boxes_labels: torch.Tensor,  # class labels for GT boxes, [R, num_classes]
+        prototypes: Dict[int, torch.Tensor],  # raw, {class_id, prototype tensor}
+        return_details: bool = True,
+        lse_alpha: float = 10.0,
+        lse_eps: float = 1e-6
+    ) -> Dict[str, Any]:
+        '''
+        :return: Similarity of GT and prototypes, {class_id : average_similarity}
+        '''
+        # 使用训练阶段一致的 mid feature 提取路径，保证 GT box 特征与原型处于同一投影空间。
+        self.hook.clear()
+        _ = self.encoder(x)
+        feature_maps = self.hook.outputs
+        # mid_feature_maps = feature_maps['mid']
+        # roi_features = self.mp_generator.roi_align(mid_feature_maps, boxes)  # [R, C, H, W]
+        high_feature_maps = feature_maps['high']
+        roi_features = self.mp_generator.roi_align(high_feature_maps, boxes)  # [R, C, H, W]
+        patch_features = self.mp_generator.patch_embed(roi_features)  # [R, Np=num_patches, D]
+        patch_features = self.projector(patch_features)  # [R, Np, D]
+
+        # sort by class_id
+        class_ids = sorted(list(prototypes.keys()))
+        # norm
+        proto_list = [prototypes[k] for k in class_ids]
+        proto_norm_list = []
+        for proto in proto_list:
+            proto_norm = F.normalize(proto, dim=-1)
+            proto_norm_list.append(proto_norm)
+        proto_mat = torch.stack(proto_norm_list, dim=0)  # [num_classes + 1, D]
+
+        R, num_classes = boxes_labels.shape
+        sims_sum = {k: 0.0 for k in range(num_classes)}
+        sims_cnt = {k: 0 for k in range(num_classes)}
+
+        # statistics: results details
+        details = {
+            "pos": {k: [] for k in range(num_classes)},  # sim_pos of each GT
+            "neg_max": {k: [] for k in range(num_classes)},  # max sim_neg of each GT
+            "margin": {k: [] for k in range(num_classes)},  # margin = sim_pos - max sim_neg
+            "bg": {k: [] for k in range(num_classes)},  # 每个 GT box 与背景原型的相似度
+        }
+
+        for i in range(R):
+            gt_label = torch.argmax(boxes_labels[i]).item()
+
+            gt_patch = patch_features[i]  # [num_patches, D]
+            gt_patch = F.normalize(gt_patch, dim=1)
+
+            # # mean pooling
+            # gt_vec = gt_patch.mean(dim=0, keepdim=True)  # [1, D]
+            # gt_vec = F.normalize(gt_vec, dim=1)  # [1, D]
+
+            # LogSumExp pooling
+            m = gt_patch.max(dim=0, keepdim=True).values  # [1, D]
+            lse = m + torch.log(torch.exp(lse_alpha * (gt_patch - m)).mean(dim=0, keepdim=True) + lse_eps) / lse_alpha
+            gt_vec = F.normalize(lse, dim=1, eps=lse_eps)  # [1, D]
+
+            # similarity of GT and prototypes(all classes)
+            sims_all = torch.matmul(gt_vec, proto_mat.t()).squeeze(0)  # [num_classes]
+
+            sim_pos = sims_all[gt_label].item()  # positive class similarity
+            sim_bg = sims_all[0].item() if 0 in class_ids else float("nan")
+
+            # max negative class similarity
+            if num_classes > 1:
+                mask = torch.ones(num_classes, dtype=torch.bool, device=sims_all.device)
+                mask[gt_label] = False
+                sim_neg_max = sims_all[mask].max().item()
+            else:
+                sim_neg_max = float("-inf")
+
+            margin = sim_pos - sim_neg_max if sim_neg_max != float("-inf") else float("inf")
+
+            sims_sum[gt_label] += sim_pos
+            sims_cnt[gt_label] += 1
+
+            if return_details:
+                details["pos"][gt_label].append(sim_pos)
+                details["neg_max"][gt_label].append(sim_neg_max)
+                details["margin"][gt_label].append(margin)
+                details["bg"][gt_label].append(sim_bg)
+
+        out = {
+            "sum": sims_sum,
+            "cnt": sims_cnt,
+        }
+        if return_details:
+            out["details"] = details
+
+        return out
+
+
     def forward(
         self,
         x: torch.Tensor,
         wboxes: torch.Tensor,  # weak boxes, [R=num_wbs, 5], for each box, [batch_idx, x1, y1, x2, y2]
-        wb_labels: torch.Tensor  # class label for weak boxes, [R, num_classes]
+        wb_labels: torch.Tensor,  # class label for weak boxes, [R, num_classes]
+        bg_boxes: torch.Tensor, # background boxes, [R_bg=num_bg_boxes, 5], for each box, [batch_idx, x1, y1, x2, y2]
     )-> Dict[str, Any]:
         """
         :return:
         out: Dict[str, Any], contains:
-        - loss_cam: Tensor, CAM loss
-        - prototypes: Dict[int, Tensor], {class_id, prototype_embeddings_raw}
-        - patch_logits: Tensor, shape [R * k, D], k=num_patches_per_wb
-        - contrast_patch_features: Tensor, patch features for SupCon, shape [R, view=1, D]
+        - 'loss_cam': Tensor, CAM loss
+        - 'prototypes': Dict[int, torch.Tensor], {class_id in [0, num_classes](0 for background) : prototype_embeddings}
+        - 'contrast_patch_features': torch.Tensor, patch features for SupCon, shape [R, V=num_views, D]
         """
         out : Dict[str, Any] = {}   # output
 
@@ -410,11 +559,31 @@ class ProtypeBuilder(nn.Module):
 
         # -----construct prototypes-----
         # prototypes: Dict[int, Tensor], {class_id, prototype_embeddings_raw}
-        loss_cam, prototypes, patch_logits, contrast_patch_features = self.mp_generator(mid_feature_maps, wboxes, wb_labels)
+        mp_g_out = self.mp_generator(
+            mid_feature_maps,
+            wboxes,
+            wb_labels,
+            bg_boxes,
+        )
+
+        # -----projection-----
+        contrast_patch_features = mp_g_out['contrast_patch_features']       # [R, V, D]
+        R, V, D = contrast_patch_features.shape
+        contrast_patch_features = contrast_patch_features.reshape(R * V, D)     # [R * V, D]
+        contrast_patch_features = self.projector(contrast_patch_features).view(R, V, D)     # [R, V, D]
+        prototypes_dict = mp_g_out['prototypes']  # {class_id, prototype_embeddings_raw}
+        proto_keys = sorted(prototypes_dict.keys())
+        expected_proto_keys = list(range(self.mp_generator.num_classes + 1))
+        if proto_keys != expected_proto_keys:
+            raise ValueError(f"原型 key 应为 {expected_proto_keys}，实际为 {proto_keys}。")
+        prototypes = torch.stack([prototypes_dict[k] for k in proto_keys], dim=0)     # [num_classes + 1, D]
+        prototypes = self.projector(prototypes)     # [num_classes + 1, D]
+        for idx, key in enumerate(proto_keys):
+            prototypes_dict[key] = prototypes[idx]
+
         out.update({
-            'loss_cam' : loss_cam,
-            'prototypes' : prototypes,
-            'patch_logits' : patch_logits,
+            'loss_cam' : mp_g_out['loss_cam'],
+            'prototypes' : prototypes_dict,
             'contrast_patch_features' : contrast_patch_features,
         })
 
@@ -436,9 +605,6 @@ def build_prototype_builder_model(
         in_c=model_cfg.in_c,
         patch_size=model_cfg.patch_size,
         embed_dim=model_cfg.embed_dim,
-        components_range=model_cfg.components_range,
-        random_state=model_cfg.random_state,
-        max_iter=model_cfg.max_iter,
         roi_out_size=model_cfg.roi_out_size_mid,
         spatial_scale=model_cfg.spatial_scale_mid,
         sampling_ratio=model_cfg.sampling_ratio

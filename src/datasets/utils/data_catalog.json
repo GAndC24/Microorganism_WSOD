@@ -25,7 +25,9 @@
             "4" : "eryth",
             "5" : "leuko",
             "6" : "mycete"
-        }
+        },
+        "num_classes": 7,
+        "bg_boxes": "Urinary Sediment Dataset/bg_boxes.pth"
     }
   }
 }

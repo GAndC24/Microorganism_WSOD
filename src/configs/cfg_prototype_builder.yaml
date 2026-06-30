@@ -5,7 +5,9 @@ RUNTIME:
 DATA:
   DATASET_NAME: "voc_urinary_sediment"
   BATCH_SIZE: 32
-  IMG_SIZE: 384
+  # W / H = 4 / 3
+  IMG_W: 384
+  IMG_H: 288
   NUM_CLASSES: 7
 
 MODEL:
@@ -14,10 +16,6 @@ MODEL:
   HIDDEN_DIM: 4096  # (512, 1024, 2048, 4096)
   LAYER_INDICES: [8, 22, 29]  # [low, mid, high]
   PATCH_SIZE: 3   # 2 or 3
-  # for GMM in Morphological Prototype Generator
-  COMPONENTS_RANGE: [2, 3, 4]
-  RANDOM_STATE: 42
-  MAX_ITER: 20
   # for RoI Align
   ROI_OUT_SIZE_MID: 21   # 14 or 21, should be divisible by PATCH_SIZE
   SAMPLING_RATIO: 2
@@ -34,5 +32,10 @@ TRAINER:
   # logs/{model_name}_train_log_{start_time}/{model_name}_checkpoints/checkpoint_{epoch}
   CHECKPOINT_PATH: ""
   W_CAM_LOSS: 0.8   # [0.1, 1.0]
-  W_PATCH_LOSS: 1.0   # [0.1, 1.0]
+  W_CONSTRAIN_LOSS: 1.0   # [0.1, 1.0]
+  W_SEP_LOSS: 0.1   # [0.1, 1.0]
   MP_EMA_ALPHA: 0.99   # [0.9, 0.99]
+
+EVAL:
+  # for eval prototypes
+  LOAD_CHECKPOINT_PATH: "logs/PrototypeBuilder_train_log_2026-06-25_12-11-59/PrototypeBuilder_checkpoints/checkpoint_40.pth"

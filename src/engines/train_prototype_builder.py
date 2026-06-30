@@ -1,14 +1,18 @@
 # train engine for Prototype Builder
-import argparse
+# run command: python -m src.engines.train_prototype_builder --config "src/configs/cfg_prototype_builder.yaml"
 import torch
 import yaml
 from typing import Dict, Any
 from pathlib import Path
 from torchvision.transforms import v2 as T
+import argparse
+import os
+
 
 from ..datasets.voc_dataset import build_voc_dataloader
 from ..models.prototype_builder import build_prototype_builder_model
 from ..utils.trainers.trainer_prototype_builder import build_prototype_builder_trainer
+
 
 
 def _load_yaml(config_path : str)-> Dict[str, Any]:
@@ -19,6 +23,16 @@ def _load_yaml(config_path : str)-> Dict[str, Any]:
         data = yaml.safe_load(f)
 
     return data or {}
+
+
+def _get_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Training Config")
+
+    p.add_argument('--config', type=str, required=True, help='config file path')
+    # # for debug
+    # p.add_argument('--config', default='src/configs/cfg_prototype_builder.yaml', type=str, help='config file path')
+
+    return p.parse_args()
 
 
 def train(
@@ -33,9 +47,11 @@ def train(
 
     # -----Init Dataloader-----
     # data preprocessing transforms
-    img_size = cfg['DATA']["IMG_SIZE"]
+    img_w = cfg['DATA']["IMG_W"]
+    img_h = cfg['DATA']["IMG_H"]
+    img_size = (img_h, img_w)
     transform_aug = T.Compose([
-        T.Resize((img_size, img_size)),
+        T.Resize(img_size),
         T.ToImage(),
         T.ToDtype(torch.float32, scale=True),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -64,3 +80,16 @@ def train(
 
     # -----Start Training-----
     trainer.train()
+
+
+def main():
+    # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
+
+    args = _get_args()
+
+    train(args.config)
+
+
+if __name__ == '__main__':
+    main()

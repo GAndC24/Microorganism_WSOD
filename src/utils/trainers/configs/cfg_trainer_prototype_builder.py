@@ -21,7 +21,8 @@ class PrototypeBuilderTrainerConfig:
     continue_train: bool = False
     checkpoint_path: str = None
     w_cam_loss : float = 0.5    # weight for cam loss
-    w_patch_loss : float = 0.5  # weight for patch loss
+    w_constrain_loss : float = 0.5  # weight for constrain loss
+    w_sep_loss : float = 0.5 # weight for separation loss
     mp_ema_alpha: float = 0.99   # ema alpha for updating prototypes, [0.9, 0.99]
 
 
@@ -49,6 +50,7 @@ def build_prototype_builder_trainer_config(
         continue_train=cfg['TRAINER']['CONTINUE_TRAIN'],
         checkpoint_path=cfg['TRAINER']['CHECKPOINT_PATH'],
         w_cam_loss=cfg['TRAINER']['W_CAM_LOSS'],
-        w_patch_loss=cfg['TRAINER']['W_PATCH_LOSS'],
+        w_constrain_loss=cfg['TRAINER']['W_CONSTRAIN_LOSS'],
+        w_sep_loss=cfg['TRAINER']['W_SEP_LOSS'],
         mp_ema_alpha=cfg['TRAINER']['MP_EMA_ALPHA']
     )

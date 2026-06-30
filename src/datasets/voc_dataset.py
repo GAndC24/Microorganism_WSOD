@@ -59,6 +59,7 @@ class VocDataset(Dataset):
         split: str,       # dataset split, "train" or "val" or "test"
         target_mode: str,    # target mode, "gt" or "wb"
         transforms: Optional[Callable] = None,      # data transforms
+        use_bg_boxes: bool = True,   # whether to use background boxes (only for "wb" mode)
     )-> None:
         super().__init__()
 
@@ -93,6 +94,9 @@ class VocDataset(Dataset):
         with open(imageset_txt, "r", encoding="utf-8") as f:
             self.img_ids = [line.strip() for line in f.readlines() if line.strip()]
 
+        if use_bg_boxes:
+            self.bg_boxes = torch.load(self.dataset_info["bg_boxes"])
+
 
     def __len__(self) -> int:
         return len(self.img_ids)
@@ -118,6 +122,7 @@ class VocDataset(Dataset):
 
         ann_boxes_tensor = torch.tensor(ann_boxes, dtype=torch.float32)  # [N,4]
         labels_tensor = torch.tensor(labels, dtype=torch.int64)  # [N]
+        bg_boxes_tensor = self.bg_boxes["records"][image_id]["boxes"]
 
         image = tv_tensors.Image(image_pil)
         ann_boxes_tv = tv_tensors.BoundingBoxes(
@@ -125,10 +130,16 @@ class VocDataset(Dataset):
             format="XYXY",
             canvas_size=(H, W)
         )
+        bg_boxes_tv = tv_tensors.BoundingBoxes(
+            bg_boxes_tensor,
+            format="XYXY",
+            canvas_size=(H, W)
+        )
 
         target: Dict[str, Any] = {
             "boxes": ann_boxes_tv,
             "labels": labels_tensor,
+            "bg_boxes": bg_boxes_tv,    # could be (0, 4)
         }
 
         if self.transforms is not None:
@@ -143,6 +154,7 @@ def build_voc_dataloader(
     target_mode: str,    # target mode, "gt" or "wb"
     batch_size: int,
     transforms: Optional[Callable] = None,      # data transforms
+
 )->DataLoader:
     dataset = VocDataset(dataset_name, split, target_mode, transforms=transforms)
 

@@ -1,266 +1,106 @@
-# Supervised Contrastive Loss
-from typing import Tuple, Optional
-from enum import Enum
-from dataclasses import dataclass
-import torch.nn.functional as F
+"""
+Author: Yonglong Tian (yonglong@mit.edu)
+Date: May 07, 2020
+"""
+from __future__ import print_function
+
 import torch
+import torch.nn as nn
 
 
-# Default All Views
-class LossContrastMode(str, Enum):
-    ALL_VIEWS = "all_views"
-    ONE_VIEW = "one_view"
+class SupConLoss(nn.Module):
+    """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
+    It also supports the unsupervised contrastive loss in SimCLR"""
+    def __init__(self, temperature=0.07, contrast_mode='all',
+                 base_temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
 
-# Default Outside
-class LossSummationLocation(str, Enum):
-    OUTSIDE = "outside"  # sum positives of log-probs
-    INSIDE = "inside"    # log of summed probs
+    def forward(self, features, labels=None, mask=None):
+        """Compute loss for model. If both `labels` and `mask` are None,
+        it degenerates to SimCLR unsupervised loss:
+        https://arxiv.org/pdf/2002.05709.pdf
 
-# Default All
-class LossDenominatorMode(str, Enum):
-    ALL = "all"                # denominator includes positives + negatives (except strict self-self)
-    ONE_POSITIVE = "one_positive"
-    ONLY_NEGATIVES = "only_negatives"
+        Args:
+            features: hidden vector of shape [bsz, n_views, ...].
+            labels: ground truth of shape [bsz].
+            mask: contrastive mask of shape [bsz, bsz], mask_{i,j}=1 if sample j
+                has the same class as sample i. Can be asymmetric.
+        Returns:
+            A loss scalar.
+        """
+        device = (torch.device('cuda')
+                  if features.is_cuda
+                  else torch.device('cpu'))
 
-# Loss Config
-@dataclass
-class SupConLossConfig:
-    temperature: float = 0.07
-    contrast_mode: LossContrastMode = LossContrastMode.ALL_VIEWS
-    summation_location: LossSummationLocation = LossSummationLocation.OUTSIDE
-    denominator_mode: LossDenominatorMode = LossDenominatorMode.ALL
-    positives_cap: int = -1  # -1 means no cap
-    scale_by_temperature: bool = True
-    reduction : str = "mean"  # 'mean' or 'sum' or 'none'
+        if len(features.shape) < 3:
+            raise ValueError('`features` needs to be [bsz, n_views, ...],'
+                             'at least 3 dimensions are required')
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
 
-def build_diagonal_mask(
-    batch_size: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """:return diagonal mask, [B, B]"""
-    return torch.eye(batch_size, device=device, dtype=dtype)
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both `labels` and `mask`')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
 
-def _create_tiled_masks(
-    untiled_class_mask_uncapped: torch.Tensor,  # [B, B] positives (uncapped)
-    diagonal_mask: torch.Tensor,                # [B, B] identity
-    num_views: int,
-    num_anchor_views: int,
-    positives_cap: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Create positives/negatives masks in view-expanded space.
-    - positives_mask is built from (optionally capped) class positives mask
-    - negatives_mask is built from UNCAPPED class positives mask complement
-    - strict self-self (same sample, same view) is removed from both
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
 
-    :return:
-    - positives_mask: [B*num_anchor_views, B*num_views]
-    - negatives_mask: same
-    - num_positives_per_row: [B*num_anchor_views]
-    """
-    device = untiled_class_mask_uncapped.device
-    dtype = untiled_class_mask_uncapped.dtype
-    B = untiled_class_mask_uncapped.shape[0]
+        # compute logits
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature)
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
 
-    # Apply cap to class positives only for positives aggregation
-    if positives_cap > -1:
-        untiled_class_mask = _cap_positives_mask(
-            untiled_mask=untiled_class_mask_uncapped,
-            diagonal_mask=diagonal_mask,
-            positives_cap=positives_cap,
-            num_views=num_views,
+        # tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
         )
-    else:
-        untiled_class_mask = untiled_class_mask_uncapped
+        mask = mask * logits_mask
 
-    # Tile into view-expanded masks
-    positives_mask = untiled_class_mask.repeat(num_anchor_views, num_views)  # [B*AV, B*V]
-    uncapped_positives_mask = untiled_class_mask_uncapped.repeat(num_anchor_views, num_views)
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
 
-    negatives_mask = (1.0 - uncapped_positives_mask)
+        # compute mean of log-likelihood over positive
+        # modified to handle edge cases when there is no positive pair
+        # for an anchor point. 
+        # Edge case e.g.:- 
+        # features of shape: [4,1,...]
+        # labels:            [0,1,1,2]
+        # loss before mean:  [nan, ..., ..., nan] 
+        mask_pos_pairs = mask.sum(1)
+        mask_pos_pairs = torch.where(mask_pos_pairs < 1e-6, 1, mask_pos_pairs)
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask_pos_pairs
 
-    # Remove strict self-self: anchor (sample i, view av) vs global (same sample i, same view av)
-    all_but_strict_self = torch.ones((B * num_anchor_views, B * num_views), device=device, dtype=dtype)
+        # loss
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
 
-    i = torch.arange(B, device=device)
-    for av in range(num_anchor_views):
-        anchor_rows = av * B + i
-        # With the packing used below (view-major packing), global columns for view av are in [av*B : (av+1)*B)
-        global_cols = av * B + i
-        all_but_strict_self[anchor_rows, global_cols] = 0.0
-
-    positives_mask = positives_mask * all_but_strict_self
-    negatives_mask = negatives_mask * all_but_strict_self
-
-    num_pos = positives_mask.sum(dim=1)  # [B*AV]
-    return positives_mask, negatives_mask, num_pos
-
-def _cap_positives_mask(
-    untiled_mask: torch.Tensor,   # [B, B] (positives)
-    diagonal_mask: torch.Tensor,  # [B, B]
-    positives_cap: int,
-    num_views: int,
-) -> torch.Tensor:
-    """
-    在样本级别的掩码中（未扩展到视图之前），为每个锚点（anchor）限制额外正样本的数量（不包括对角线上的样本，即排除自我匹配的样本）。
-    :return capped mask, [B, B]
-    """
-    if positives_cap <= -1:
-        return untiled_mask
-
-    # Remove diagonal (same sample), keep it separately
-    mask_no_diag = torch.minimum(untiled_mask, (1.0 - diagonal_mask))
-
-    k = positives_cap // num_views  # cap in sample-space
-    if k <= 0:
-        return diagonal_mask.clone()
-
-    # Row-wise topk on {0,1} mask; may include zeros if insufficient positives
-    values, indices = torch.topk(mask_no_diag, k=min(k, mask_no_diag.shape[1]), dim=1)
-
-    capped = torch.zeros_like(mask_no_diag)
-    row_idx = torch.arange(mask_no_diag.shape[0], device=mask_no_diag.device).unsqueeze(1)
-    keep = values > 0
-    if keep.any():
-        capped[row_idx.expand_as(indices)[keep], indices[keep]] = 1.0
-
-    # Add diagonal back
-    capped = torch.maximum(capped, diagonal_mask)
-    return capped
-
-def supervised_contrastive_loss(
-    features: torch.Tensor,                 # [B = num_wbb, V = num_views, D]
-    labels: Optional[torch.Tensor] = None,  # [B = num_wbb, num_classes] one-hot
-    cfg: SupConLossConfig = SupConLossConfig(),
-) -> torch.Tensor:
-    """:return: loss: Weal Box Contrastive Loss pre sample, [B]"""
-    # Minimal inline checks
-    if features.dim() < 3:
-        raise ValueError(f"`features` must be [B, V, D] with dim>=3, got {tuple(features.shape)}")
-
-    features = F.normalize(features, dim=-1, eps=1e-6)
-    B, V = features.shape[0], features.shape[1]
-    if B <= 0 or V <= 0:
-        raise ValueError(f"Invalid B or V from features shape={tuple(features.shape)}")
-
-    if labels is not None:
-        if labels.dim() != 2:
-            raise ValueError(f"`labels` must be [B, C] (rank-2), got {tuple(labels.shape)}")
-        if labels.shape[0] != B:
-            raise ValueError(f"labels.shape[0] must equal B. labels={labels.shape[0]}, B={B}")
-
-    if cfg.positives_cap is not None and cfg.positives_cap > -1:
-        if cfg.positives_cap % V != 0:
-            raise ValueError(
-                f"positives_cap must be multiple of num_views. positives_cap={cfg.positives_cap}, num_views={V}"
-            )
-
-    device = features.device
-
-    # Flatten to [B, V, D]
-    if features.dim() > 3:
-        features = features.view(B, V, -1)
-    features = features.float()
-
-    # Single GPU: global == local
-    global_features = features  # [B, V, D]
-    diagonal_mask = build_diagonal_mask(B, device=device, dtype=features.dtype)  # [B, B]
-
-    # Build sample-level class mask (uncapped)
-    if labels is None:
-        # self-supervised (SimCLR-like): sample-level positives are "same sample"
-        untiled_class_mask_uncapped = diagonal_mask
-    else:
-        labels = labels.to(device=device, dtype=features.dtype)
-        global_labels = labels
-        class_sim = torch.matmul(labels, global_labels.t())  # [B, B]
-        untiled_class_mask_uncapped = (class_sim > 0).to(features.dtype)
-
-    # Pack global features view-major: [B,V,D] -> [V,B,D] -> [V*B, D]
-    all_global = global_features.permute(1, 0, 2).contiguous().view(V * B, -1)
-
-    # Select anchor features
-    if cfg.contrast_mode == LossContrastMode.ONE_VIEW:
-        anchor = features[:, 0, :].contiguous()  # [B, D]
-        num_anchor_views = 1
-    elif cfg.contrast_mode == LossContrastMode.ALL_VIEWS:
-        anchor = features.permute(1, 0, 2).contiguous().view(V * B, -1)  # [V*B, D]
-        num_anchor_views = V
-    else:
-        raise ValueError(f"Unknown contrast_mode: {cfg.contrast_mode}")
-
-    # Logits: [B*AV, V*B]
-    logits = torch.matmul(anchor, all_global.t()) / float(cfg.temperature)
-    logits = logits - logits.max(dim=1, keepdim=True).values.detach()  # stability
-    exp_logits = torch.exp(logits)
-
-    # Masks
-    positives_mask, negatives_mask, num_pos = _create_tiled_masks(
-        untiled_class_mask_uncapped=untiled_class_mask_uncapped,
-        diagonal_mask=diagonal_mask,
-        num_views=V,
-        num_anchor_views=num_anchor_views,
-        positives_cap=cfg.positives_cap,
-    )
-
-    eps = 1e-12
-
-    # ---- Denominator ----
-    if cfg.denominator_mode == LossDenominatorMode.ALL:
-        denom = exp_logits.sum(dim=1, keepdim=True)  # [B*AV, 1]
-        denom_matrix = None
-    elif cfg.denominator_mode == LossDenominatorMode.ONLY_NEGATIVES:
-        denom = (exp_logits * negatives_mask).sum(dim=1, keepdim=True)  # [B*AV, 1]
-        denom_matrix = None
-    elif cfg.denominator_mode == LossDenominatorMode.ONE_POSITIVE:
-        neg_sum = (exp_logits * negatives_mask).sum(dim=1, keepdim=True)  # [B*AV, 1]
-        denom_matrix = neg_sum + exp_logits  # [B*AV, V*B]
-        denom = None
-    else:
-        raise ValueError(f"Unknown denominator_mode: {cfg.denominator_mode}")
-
-    # Summation location
-    if cfg.summation_location == LossSummationLocation.OUTSIDE:
-        if cfg.denominator_mode == LossDenominatorMode.ONE_POSITIVE:
-            log_prob = logits - torch.log(denom_matrix + eps)
-            pos_log_prob = (log_prob * positives_mask).sum(dim=1)
-        else:
-            log_prob = logits - torch.log(denom + eps)
-            pos_log_prob = (log_prob * positives_mask).sum(dim=1)
-
-        pos_log_prob = torch.where(num_pos > 0, pos_log_prob / (num_pos + eps), torch.zeros_like(pos_log_prob))
-        loss = -pos_log_prob
-
-    elif cfg.summation_location == LossSummationLocation.INSIDE:
-        if cfg.denominator_mode == LossDenominatorMode.ONE_POSITIVE:
-            probs = (exp_logits / (denom_matrix + eps)) * positives_mask
-        else:
-            probs = (exp_logits / (denom + eps)) * positives_mask
-
-        pos_prob_sum = probs.sum(dim=1)
-        mean_pos_prob = torch.where(num_pos > 0, pos_prob_sum / (num_pos + eps), torch.zeros_like(pos_prob_sum))
-        loss = -torch.log(mean_pos_prob + eps)
-    else:
-        raise ValueError(f"Unknown summation_location: {cfg.summation_location}")
-
-    if cfg.scale_by_temperature:
-        loss = loss * float(cfg.temperature)
-
-    # Reduce anchors -> per-sample [B]
-    if num_anchor_views > 1:
-        loss = loss.view(num_anchor_views, B).mean(dim=0)
-    else:
-        loss = loss.view(B)
-
-    # Final reduction
-    if cfg.reduction == "mean":
-        loss = loss.mean()
-    elif cfg.reduction == "sum":
-        loss = loss.sum()
-    elif cfg.reduction == "none":
-        pass
-    else:
-        raise ValueError(f"Unknown reduction: {cfg.reduction}")
-
-    return loss
+        return loss

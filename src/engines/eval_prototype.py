@@ -1,23 +1,37 @@
-import argparse
-import os
-import torch
-import yaml
-from typing import Dict, Any, List
+# evaluate engine for Prototype
+# run command: python -m src.engines.eval_prototype --config "src/configs/cfg_prototype_builder.yaml"
+import csv
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
-from torch.utils.data import DataLoader
+from typing import Any, Dict, List, Optional, Tuple
+import matplotlib
+import numpy as np
+import torch
+import os
+import yaml
 from torchvision.transforms import v2 as T
 from tqdm.auto import tqdm
-import matplotlib.pyplot as plt
-from collections import defaultdict
-import csv
-import numpy as np
-from datetime import datetime
+import argparse
 
 from ..datasets.voc_dataset import build_voc_dataloader
-from ..models.prototype_evaluator import build_prototype_evaluator
+from ..models.prototype_builder import build_prototype_builder_model
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
-def _load_yaml(config_path : str)-> Dict[str, Any]:
+def _get_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Training Config")
+
+    p.add_argument('--config', type=str, required=True, help='config file path')
+    # # for debug
+    # p.add_argument('--config', default='src/configs/cfg_eval_prototype.yaml', type=str, help='config file path')
+
+    return p.parse_args()
+
+
+def _load_yaml(config_path: str) -> Dict[str, Any]:
     config_path = Path(config_path)
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
@@ -27,201 +41,282 @@ def _load_yaml(config_path : str)-> Dict[str, Any]:
     return data or {}
 
 
+def _resolve_device(device_name: str) -> torch.device:
+    if device_name == "cuda" and not torch.cuda.is_available():
+        print("配置请求使用 cuda，但当前环境不可用，已切换到 cpu。")
+        return torch.device("cpu")
+    return torch.device(device_name)
+
+
+def _build_image_size(cfg: Dict[str, Any]) -> Tuple[int, int]:
+    data_cfg = cfg["DATA"]
+    if "IMG_SIZE" in data_cfg:
+        img_size = int(data_cfg["IMG_SIZE"])
+        return img_size, img_size
+    return int(data_cfg["IMG_H"]), int(data_cfg["IMG_W"])
+
+
+def _load_checkpoint(path: Optional[Path], device: torch.device) -> Optional[Dict[str, Any]]:
+    if path is None:
+        print("未找到 checkpoint，模型将使用初始化权重进行评估。")
+        return None
+    checkpoint = torch.load(path, map_location=device)
+    print(f"Loaded checkpoint: {path}")
+    return checkpoint
+
+
+def _load_model_weights(model: torch.nn.Module, checkpoint: Optional[Dict[str, Any]]) -> None:
+    if checkpoint is None:
+        return
+    if "model_state_dict" not in checkpoint:
+        raise KeyError("checkpoint 中缺少 model_state_dict。")
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+
+
+def _load_prototypes(
+    checkpoint: Optional[Dict[str, Any]],
+    device: torch.device,
+) -> Dict[int, torch.Tensor]:
+    if checkpoint is not None and "dataset_MPs" in checkpoint:
+        prototypes = checkpoint["dataset_MPs"]
+        print("Loaded dataset MPs from checkpoint.")
+    else:
+        raise FileNotFoundError("未找到 dataset_MPs。")
+
+    return {int(k): v.to(device) for k, v in prototypes.items()}
+
+
 def _build_boxes(targets: List[Dict[str, torch.Tensor]]) -> torch.Tensor:
     """
-    Construct boxes tensor from targets.
-    :param targets: List of dictionaries containing bounding box information.
-    :return: GT boxes tensor of shape [R, 5], where each box is [batch_idx, x1, y1, x2, y2].
+    从 targets 构造 RoIAlign 需要的 GT box 张量。
+    :return: [R, 5]，每行格式为 [batch_idx, x1, y1, x2, y2]
     """
     gt_boxes = []
     for batch_idx, target in enumerate(targets):
-        boxes = target["boxes"]  # Convert to [x1, y1, x2, y2]
+        boxes = target["boxes"]
+        if boxes.numel() == 0:
+            continue
         batch_indices = torch.full((boxes.size(0), 1), batch_idx, dtype=boxes.dtype, device=boxes.device)
-        gt_boxes.append(torch.cat([batch_indices, boxes], dim=1))  # Combine batch_idx with boxes
+        gt_boxes.append(torch.cat([batch_indices, boxes], dim=1))
 
-    return torch.cat(gt_boxes, dim=0)  # Concatenate all boxes across the batch
+    if not gt_boxes:
+        device = targets[0]["boxes"].device if targets else torch.device("cpu")
+        return torch.empty((0, 5), dtype=torch.float32, device=device)
+    return torch.cat(gt_boxes, dim=0)
 
 
-def _build_boxes_label(targets: List[Dict[str, torch.Tensor]], num_classes: int) -> torch.Tensor:
+def _build_boxes_label(targets: List[Dict[str, torch.Tensor]], num_classes_with_bg: int) -> torch.Tensor:
     """
-    construct one-hot labels for a batch of boxes
-    :param targets: image annotations
-    :param num_classes : number of classes
-    :return: labels : one-hot tensor, [R = num_boxes, num_classes]
+    为 GT boxes 构造 one-hot 标签。0 预留给背景，前景类别整体右移一位。
+    :return: [R, num_classes_with_bg]
     """
     all_labels = []
     for target in targets:
-        all_labels.append(target["labels"])
-    all_labels = torch.cat(all_labels, dim=0)  # [R]
-    one_hot_labels = torch.zeros((all_labels.size(0), num_classes), dtype=torch.float32).to(all_labels.device)
+        labels = target["labels"]
+        if labels.numel() == 0:
+            continue
+        all_labels.append(labels + 1)
+
+    if not all_labels:
+        device = targets[0]["labels"].device if targets else torch.device("cpu")
+        return torch.empty((0, num_classes_with_bg), dtype=torch.float32, device=device)
+
+    all_labels = torch.cat(all_labels, dim=0)
+    one_hot_labels = torch.zeros((all_labels.size(0), num_classes_with_bg), dtype=torch.float32, device=all_labels.device)
     one_hot_labels.scatter_(1, all_labels.unsqueeze(1), 1.0)
     return one_hot_labels
 
 
-def _evaluate_similarity_and_margin(model, loader, prototypes, num_classes, device, save_dir, split_name):
-    os.makedirs(save_dir, exist_ok=True)
+def _safe_stats(values: List[float]) -> Dict[str, float]:
+    if len(values) == 0:
+        return {"mean": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "gt0_rate": 0.0}
+    arr = np.array(values, dtype=np.float32)
+    return {
+        "mean": float(arr.mean()),
+        "p25": float(np.percentile(arr, 25)),
+        "p50": float(np.percentile(arr, 50)),
+        "p75": float(np.percentile(arr, 75)),
+        "gt0_rate": float((arr > 0).mean()),
+    }
 
-    # 全局加权统计：sum/cnt
-    global_sum = {k: 0.0 for k in range(num_classes)}
-    global_cnt = {k: 0   for k in range(num_classes)}
 
-    # 分布统计（用于画图与分位数）
+def _plot_hist(values: List[float], title: str, xlabel: str, save_path: Path) -> None:
+    if len(values) == 0:
+        return
+    plt.figure()
+    plt.hist(values, bins=40)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel("frequency")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+
+def _evaluate_similarity_and_margin(
+    model: torch.nn.Module,
+    loader,
+    prototypes: Dict[int, torch.Tensor],
+    num_classes_with_bg: int,
+    device: torch.device,
+    save_dir: Path,
+    split_name: str,
+):
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    global_sum = {k: 0.0 for k in range(num_classes_with_bg)}
+    global_cnt = {k: 0 for k in range(num_classes_with_bg)}
+
     pos_list = defaultdict(list)
-    negmax_list = defaultdict(list)
     margin_list = defaultdict(list)
+    bg_list = defaultdict(list)
 
     model.eval()
-    num_iters = len(loader)
     pbar = tqdm(
         enumerate(loader, start=1),
-        total=num_iters,
-        desc=f"Computing",
+        total=len(loader),
+        desc=f"Computing {split_name}",
         leave=False,
         dynamic_ncols=True,
     )
     with torch.no_grad():
-        for iter, (images, target) in pbar:
+        for _, (images, target) in pbar:
             images = [img.to(device) for img in images]
-            x = torch.stack(images, dim=0)
             targets = [{k: v.to(device) for k, v in t.items()} for t in target]
 
             boxes = _build_boxes(targets)
-            boxes_labels = _build_boxes_label(targets, num_classes)
+            boxes_labels = _build_boxes_label(targets, num_classes_with_bg)
+            if boxes.size(0) == 0:
+                continue
 
-            out = model(x, boxes, boxes_labels, prototypes, return_details=True)
+            x = torch.stack(images, dim=0)
+            out = model.eval_prototype(x, boxes, boxes_labels, prototypes, return_details=True)
 
-            # 1) 全局加权
-            for k in range(num_classes):
+            for k in range(num_classes_with_bg):
                 global_sum[k] += float(out["sum"][k])
                 global_cnt[k] += int(out["cnt"][k])
 
-            # 2) 分布数据
             details = out["details"]
-            for k in range(num_classes):
+            for k in range(num_classes_with_bg):
                 pos_list[k].extend(details["pos"][k])
-                negmax_list[k].extend(details["neg_max"][k])
                 margin_list[k].extend(details["margin"][k])
+                bg_list[k].extend(details["bg"][k])
 
-    # 计算全局加权均值
-    mean_pos = {}
-    for k in range(num_classes):
-        mean_pos[k] = (global_sum[k] / global_cnt[k]) if global_cnt[k] > 0 else 0.0
+    mean_pos = {
+        k: (global_sum[k] / global_cnt[k]) if global_cnt[k] > 0 else 0.0
+        for k in range(num_classes_with_bg)
+    }
 
-    # 输出与保存统计表（csv）
-    csv_path = os.path.join(save_dir, f"{split_name}_proto_stats.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+    csv_path = save_dir / f"{split_name}_proto_stats.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
             "class_id", "cnt",
             "mean_pos",
+            "mean_bg", "p25_bg", "p50_bg", "p75_bg",
             "mean_margin", "p25_margin", "p50_margin", "p75_margin",
-            "pos_rate(sim>0)", "margin_rate(margin>0)"
+            "pos_rate(sim>0)", "bg_rate(sim>0)", "margin_rate(margin>0)",
         ])
-        for k in range(num_classes):
+        for k in range(num_classes_with_bg):
             cnt = global_cnt[k]
             if cnt == 0:
-                writer.writerow([k, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                writer.writerow([k, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
                 continue
 
-            m = np.array(margin_list[k], dtype=np.float32)
-            p = np.array(pos_list[k], dtype=np.float32)
-
+            pos_stats = _safe_stats(pos_list[k])
+            bg_stats = _safe_stats(bg_list[k])
+            margin_stats = _safe_stats(margin_list[k])
             writer.writerow([
                 k, cnt,
                 float(mean_pos[k]),
-                float(m.mean()), float(np.percentile(m, 25)), float(np.percentile(m, 50)), float(np.percentile(m, 75)),
-                float((p > 0).mean()), float((m > 0).mean())
+                bg_stats["mean"], bg_stats["p25"], bg_stats["p50"], bg_stats["p75"],
+                margin_stats["mean"], margin_stats["p25"], margin_stats["p50"], margin_stats["p75"],
+                pos_stats["gt0_rate"], bg_stats["gt0_rate"], margin_stats["gt0_rate"],
             ])
 
-    # 画分布图：pos 与 margin（每类两张图）
-    for k in range(num_classes):
-        if len(pos_list[k]) == 0:
-            continue
-
-        # pos hist
-        plt.figure()
-        plt.hist(pos_list[k], bins=40)
-        plt.title(f"{split_name} Class {k} - sim_pos distribution (cnt={len(pos_list[k])})")
-        plt.xlabel("cosine(sim_pos)")
-        plt.ylabel("frequency")
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f"{split_name}_class{k}_pos_hist.png"))
-        plt.close()
-
-        # margin hist
-        plt.figure()
-        plt.hist(margin_list[k], bins=40)
-        plt.title(f"{split_name} Class {k} - margin=pos-maxneg (cnt={len(margin_list[k])})")
-        plt.xlabel("margin")
-        plt.ylabel("frequency")
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f"{split_name}_class{k}_margin_hist.png"))
-        plt.close()
+    for k in range(num_classes_with_bg):
+        _plot_hist(
+            pos_list[k],
+            f"{split_name} Class {k} - sim_pos distribution (cnt={len(pos_list[k])})",
+            "cosine(sim_pos)",
+            save_dir / f"{split_name}_class{k}_pos_hist.png",
+        )
+        _plot_hist(
+            bg_list[k],
+            f"{split_name} Class {k} - sim_bg distribution (cnt={len(bg_list[k])})",
+            "cosine(sim_bg)",
+            save_dir / f"{split_name}_class{k}_bg_hist.png",
+        )
+        _plot_hist(
+            margin_list[k],
+            f"{split_name} Class {k} - margin=pos-maxneg (cnt={len(margin_list[k])})",
+            "margin",
+            save_dir / f"{split_name}_class{k}_margin_hist.png",
+        )
 
     return mean_pos, global_cnt, csv_path, save_dir
 
 
-def eval(
-    config_path : str,
-)-> None:
+def eval(config_path: str) -> None:
     cfg = _load_yaml(config_path)
+    device = _resolve_device(cfg["RUNTIME"]["DEVICE"])
 
-    # -----Init Dataloader-----
-    # data preprocessing transforms
-    img_size = cfg['DATA']["IMG_SIZE"]
+    img_size = _build_image_size(cfg)
     transform = T.Compose([
-        T.Resize((img_size, img_size)),
+        T.Resize(img_size),
         T.ToImage(),
         T.ToDtype(torch.float32, scale=True),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    train_loader = build_voc_dataloader(
-        dataset_name=cfg['DATA']['DATASET_NAME'],
-        split='train',
-        target_mode='gt',
-        batch_size=cfg['DATA']['BATCH_SIZE'],
-        transforms=transform,
-    )
-    val_loader = build_voc_dataloader(
-        dataset_name=cfg['DATA']['DATASET_NAME'],
-        split='val',
-        target_mode='gt',
-        batch_size=cfg['DATA']['BATCH_SIZE'],
-        transforms=transform,
-    )
-    # test_loader = build_voc_dataloader(
-    #     dataset_name=cfg['DATA']['DATASET_NAME'],
-    #     split='test',
-    #     target_mode='gt',
-    #     batch_size=cfg['DATA']['BATCH_SIZE'],
-    #     transforms=transform,
-    # )
+    splits = ["train", "val"]
+    loaders = {
+        split: build_voc_dataloader(
+            dataset_name=cfg["DATA"]["DATASET_NAME"],
+            split=split,
+            target_mode="gt",
+            batch_size=cfg["DATA"]["BATCH_SIZE"],
+            transforms=transform,
+        )
+        for split in splits
+    }
 
+    model = build_prototype_builder_model(cfg).to(device)
+    checkpoint_path = cfg['EVAL']['LOAD_CHECKPOINT_PATH']
+    checkpoint = _load_checkpoint(checkpoint_path, device)
+    _load_model_weights(model, checkpoint)
+    prototypes = _load_prototypes(checkpoint, device)
 
-    # -----Init Model-----
-    model = build_prototype_evaluator(cfg)
-    model = model.to(cfg['RUNTIME']['DEVICE'])
-    model.eval()
+    expected_proto_keys = set(range(cfg["DATA"]["NUM_CLASSES"] + 1))
+    if set(prototypes.keys()) != expected_proto_keys:
+        raise ValueError(f"原型 key 应为 {sorted(expected_proto_keys)}，实际为 {sorted(prototypes.keys())}。")
 
-    # -----Load Dataset Morphological Prototypes-----
-    prototypes = torch.load(cfg['MODEL']['DATASET_MPS_PATH'])
-    prototypes = {k: v.to(cfg['RUNTIME']['DEVICE']) for k, v in prototypes.items()}
-
-
-    # -----Evaluate similarity and margin distributions-----
     start_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    save_dir = f"./results/proto_eval/{start_time}"
-    train_mean_pos, train_cnt, train_csv, train_dir = _evaluate_similarity_and_margin(
-        model, train_loader, prototypes, cfg['DATA']['NUM_CLASSES'], cfg['RUNTIME']['DEVICE'], save_dir=save_dir, split_name="train"
-    )
-    val_mean_pos, val_cnt, val_csv, val_dir = _evaluate_similarity_and_margin(
-        model, val_loader, prototypes, cfg['DATA']['NUM_CLASSES'], cfg['RUNTIME']['DEVICE'], save_dir=save_dir, split_name="val"
-    )
-    # test_mean_pos, test_cnt, test_csv, test_dir = _evaluate_similarity_and_margin(
-    #     model, test_loader, prototypes, cfg['DATA']['NUM_CLASSES'], cfg['RUNTIME']['DEVICE'], save_dir=save_dir, split_name="test"
-    # )
+    save_dir = Path("results") / "proto_eval" / start_time
+    num_classes_with_bg = cfg["DATA"]["NUM_CLASSES"] + 1
+
     print("\n-----Prototype Similarity & Margin Evaluation Results-----")
-    print(train_mean_pos, train_cnt, train_csv, train_dir)
-    print(val_mean_pos, val_cnt, val_csv, val_dir)
-    # print(test_mean_pos, test_cnt, test_csv, test_dir)
+    for split, loader in loaders.items():
+        mean_pos, cnt, csv_path, out_dir = _evaluate_similarity_and_margin(
+            model=model,
+            loader=loader,
+            prototypes=prototypes,
+            num_classes_with_bg=num_classes_with_bg,
+            device=device,
+            save_dir=save_dir,
+            split_name=split,
+        )
+        print(f"{split}: mean_pos={mean_pos}, cnt={cnt}, csv={csv_path}, dir={out_dir}")
+
+
+def main():
+    # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
+
+    args = _get_args()
+
+    eval(args.config)
+
+
+if __name__ == '__main__':
+    main()

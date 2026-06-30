@@ -4,11 +4,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from tqdm.auto import tqdm
-from typing import Dict, List
+from typing import Dict, List, Tuple
+import torch.nn.functional as F
 
 from .configs.cfg_trainer_prototype_builder import PrototypeBuilderTrainerConfig, build_prototype_builder_trainer_config
-from ..losses.loss_funcs import get_patch_cls_loss
-from ..losses.supcon_loss import SupConLossConfig, LossContrastMode, supervised_contrastive_loss
+from ..losses.loss_funcs import get_constrain_loss, get_sep_loss
 
 
 def _build_image_multi_hot(targets: List[Dict[str, torch.Tensor]], num_classes: int) -> torch.Tensor:
@@ -26,12 +26,14 @@ def _build_image_multi_hot(targets: List[Dict[str, torch.Tensor]], num_classes: 
     return labels
 
 
-def _build_wb_one_hot(targets: List[Dict[str, torch.Tensor]], num_classes: int) -> torch.Tensor:
+def _build_wb_one_hot(targets: List[Dict[str, torch.Tensor]], num_classes: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     construct one-hot labels for a batch of weak boxes
     :param targets: image annotations
     :param num_classes : number of classes
-    :return: labels : one-hot tensor, [R = num_wbb, num_classes]
+    :return:
+    - one_hot_labels: one-hot tensor, [R = num_wbb, num_classes]
+    - all_labels: all labels, [R]
     """
     all_labels = []
     for target in targets:
@@ -39,7 +41,7 @@ def _build_wb_one_hot(targets: List[Dict[str, torch.Tensor]], num_classes: int) 
     all_labels = torch.cat(all_labels, dim=0)  # [R]
     one_hot_labels = torch.zeros((all_labels.size(0), num_classes), dtype=torch.float32).to(all_labels.device)
     one_hot_labels.scatter_(1, all_labels.unsqueeze(1), 1.0)
-    return one_hot_labels
+    return one_hot_labels, all_labels
 
 
 def _build_wboxes(targets: List[Dict[str, torch.Tensor]]) -> torch.Tensor:
@@ -55,6 +57,21 @@ def _build_wboxes(targets: List[Dict[str, torch.Tensor]]) -> torch.Tensor:
         wboxes.append(torch.cat([batch_indices, boxes], dim=1))  # Combine batch_idx with boxes
 
     return torch.cat(wboxes, dim=0)  # Concatenate all boxes across the batch
+
+
+def _build_bg_boxes(targets: List[Dict[str, torch.Tensor]]) -> torch.Tensor:
+    """
+    Construct background boxes tensor from targets.
+    :param targets: List of dictionaries containing bounding box information.
+    :return: bg_boxes tensor of shape [B, 5], where each box is [batch_idx, x1, y1, x2, y2].
+    """
+    bg_boxes = []
+    for batch_idx, target in enumerate(targets):
+        boxes = target["bg_boxes"]
+        batch_indices = torch.full((boxes.size(0), 1), batch_idx, dtype=boxes.dtype, device=boxes.device)
+        bg_boxes.append(torch.cat([batch_indices, boxes], dim=1))
+
+    return torch.cat(bg_boxes, dim=0)  # Concatenate all background boxes across the batch
 
 
 class PrototypeBuilderTrainer:
@@ -91,7 +108,7 @@ class PrototypeBuilderTrainer:
         self.logger = cfg.logger
         self.log_path = self.logger.log_dir
 
-        self.dataset_MPs : Dict[int, torch.Tensor] = {}     # {class_id : prototype_embeddings_raw}
+        self.dataset_MPs : Dict[int, torch.Tensor] = {}     # {class_id in [0, num_classes](0 for background) : prototype tensor}
 
         if cfg.continue_train:
             # load checkpoint
@@ -157,27 +174,61 @@ class PrototypeBuilderTrainer:
         epoch_losses = {
             'total' : 0.0,
             'cam' : 0.0,
-            'patch' : 0.0,
-            'patch_cls' : 0.0,
-            'patch_supcon' : 0.0
+            'constrain' : 0.0,
+            'constrain_supcon' : 0.0,
+            'constrain_proto' : 0.0,
+            'sep' : 0.0,
+            'sep_fg' : 0.0,
+            'sep_bg' : 0.0,
         }
         for iter, (images, target) in pbar:
             images = [img.to(self.cfg.device) for img in images]
             targets = [{k: v.to(self.cfg.device) for k, v in t.items()} for t in target]
 
             wboxes = _build_wboxes(targets).to(self.cfg.device)
-            wb_one_hot_labels = _build_wb_one_hot(targets, self.cfg.num_classes).to(self.cfg.device)
+            bg_boxes = _build_bg_boxes(targets).to(self.cfg.device)
+            wb_one_hot_labels, all_labels = _build_wb_one_hot(targets, self.cfg.num_classes)
+            wb_one_hot_labels, all_labels = wb_one_hot_labels.to(self.cfg.device), all_labels.to(self.cfg.device)
             X = torch.stack(images, dim=0)
-            out = self.model(X, wboxes, wb_one_hot_labels)
+            out = self.model(X, wboxes, wb_one_hot_labels, bg_boxes)
 
-            self._update_dataset_mps_ema(out['prototypes'])
+            if epoch == 1:
+                self._update_dataset_mps_ema(out['prototypes'])
 
-            loss_patch_cls = get_patch_cls_loss(out['patch_logits'], wb_one_hot_labels)
-            supcon_loss_config = SupConLossConfig()
-            supcon_loss_config.contrast_mode = LossContrastMode.ONE_VIEW
-            loss_patch_supcon = supervised_contrastive_loss(out['contrast_patch_features'], wb_one_hot_labels, supcon_loss_config)
-            loss_patch = loss_patch_cls + loss_patch_supcon
-            loss = self.cfg.w_cam_loss * out['loss_cam'] + self.cfg.w_patch_loss * loss_patch
+            dataset_prototypes_dict = self.dataset_MPs
+            proto_keys = sorted(dataset_prototypes_dict.keys())
+            expected_proto_keys = list(range(self.cfg.num_classes + 1))
+            if proto_keys != expected_proto_keys:
+                raise ValueError(f"原型 key 应为 {expected_proto_keys}，实际为 {proto_keys}。")
+            dataset_prototypes = torch.stack([dataset_prototypes_dict[k] for k in proto_keys], dim=0)  # [num_classes + 1, D]
+            dataset_prototypes_norm = F.normalize(dataset_prototypes, dim=-1)
+            for idx, key in enumerate(proto_keys):
+                dataset_prototypes_dict[key] = dataset_prototypes_norm[idx]
+            contrast_patch_features_norm = F.normalize(out['contrast_patch_features'], dim=-1)
+            loss_constrain_dict = get_constrain_loss(
+                contrast_patch_features_norm,
+                all_labels,
+                dataset_prototypes_dict
+            )
+
+            batch_prototypes_dict = {}
+            for idx, key in enumerate(proto_keys):
+                dataset_prototypes_dict[key] = dataset_prototypes_dict[key].detach()
+                batch_prototype = F.normalize(out['prototypes'][key], dim=-1)
+                batch_prototypes_dict[key] = batch_prototype
+            valid_fg_class_ids = all_labels.unique() + 1
+            loss_sep_dict = get_sep_loss(
+                dataset_prototypes=dataset_prototypes_dict,
+                batch_prototypes=batch_prototypes_dict,
+                valid_fg_class_ids=valid_fg_class_ids,
+            )
+
+            loss = (self.cfg.w_cam_loss * out['loss_cam'] +
+                    self.cfg.w_constrain_loss * loss_constrain_dict['loss_constrain'] +
+                    self.cfg.w_sep_loss * loss_sep_dict['loss_sep'])
+
+            if epoch > 1:
+                self._update_dataset_mps_ema(out['prototypes'])
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -186,14 +237,18 @@ class PrototypeBuilderTrainer:
 
             epoch_losses['total'] += loss.item()
             epoch_losses['cam'] += out['loss_cam'].item()
-            epoch_losses['patch'] += loss_patch.item()
-            epoch_losses['patch_cls'] += loss_patch_cls.item()
-            epoch_losses['patch_supcon'] += loss_patch_supcon.item()
+            epoch_losses['constrain'] += loss_constrain_dict['loss_constrain'].item()
+            epoch_losses['constrain_supcon'] += loss_constrain_dict['loss_constrain_supcon'].item()
+            epoch_losses['constrain_proto'] += loss_constrain_dict['loss_constrain_proto'].item()
+            epoch_losses['sep'] += loss_sep_dict['loss_sep'].item()
+            epoch_losses['sep_fg'] += loss_sep_dict['loss_sep_fg'].item()
+            epoch_losses['sep_bg'] += loss_sep_dict['loss_sep_bg'].item()
 
             pbar.set_postfix({
                 "Iter Loss: Total": f"{loss.item():.4f} ",
                 "CAM": f"{out['loss_cam'].item():.4f} ",
-                "Patch": f"{loss_patch.item():.4f} ",
+                "Constrain": f"{loss_constrain_dict['loss_constrain'].item():.4f} ",
+                "Sep": f"{loss_sep_dict['loss_sep'].item():.4f} ",
                 "lr": f"{self.optimizer.param_groups[0]['lr']}",
             })
 
@@ -202,25 +257,34 @@ class PrototypeBuilderTrainer:
         num_iters = len(self.train_loader)
         average_total_loss = epoch_losses['total'] / num_iters
         average_cam_loss = epoch_losses['cam'] / num_iters
-        average_patch_loss = epoch_losses['patch'] / num_iters
-        average_patch_cls_loss = epoch_losses['patch_cls'] / num_iters
-        average_patch_supcon_loss = epoch_losses['patch_supcon'] / num_iters
+        average_constrain_loss = epoch_losses['constrain'] / num_iters
+        average_constrain_supcon_loss = epoch_losses['constrain_supcon'] / num_iters
+        average_constrain_proto_loss = epoch_losses['constrain_proto'] / num_iters
+        average_sep_loss = epoch_losses['sep'] / num_iters
+        average_sep_fg_loss = epoch_losses['sep_fg'] / num_iters
+        average_sep_bg_loss = epoch_losses['sep_bg'] / num_iters
 
         self.logger.add_info(
             f"Epoch [{epoch}/{self.cfg.epochs}]"
             f"Total Loss: {average_total_loss:.4f}, "
             f"CAM Loss: {average_cam_loss:.4f}\n"
-            f"Patch Loss: {average_patch_loss:.4f} "
-            f"Patch CLS Loss : {average_patch_cls_loss:.4f} "
-            f"Patch SupCon Loss : {average_patch_supcon_loss:.4f} \n"
+            f"Constrain Loss: {average_constrain_loss:.4f} "
+            f"Constrain SupCon Loss : {average_constrain_supcon_loss:.4f} "
+            f"Constrain Proto Loss : {average_constrain_proto_loss:.4f} \n"
+            f"Sep Loss: {average_sep_loss:.4f} "
+            f"Sep FG Loss: {average_sep_fg_loss:.4f}"
+            f"Sep BG Loss: {average_sep_bg_loss:.4f}"
         )
         metrics = {
             'Epoch': epoch,
             'Total Loss': average_total_loss,
             'CAM Loss': average_cam_loss,
-            'Patch Loss': average_patch_loss,
-            'Patch CLS Loss': average_patch_cls_loss,
-            'Patch SupCon Loss': average_patch_supcon_loss,
+            'Constrain Loss': average_constrain_loss,
+            'Constrain SupCon Loss': average_constrain_supcon_loss,
+            'Constrain Proto Loss': average_constrain_proto_loss,
+            'Sep Loss': average_sep_loss,
+            'Sep FG Loss': average_sep_fg_loss,
+            'Sep BG Loss': average_sep_bg_loss,
         }
         self.logger.add_metrics(metrics)
 
@@ -240,17 +304,17 @@ class PrototypeBuilderTrainer:
         print(f"Checkpoint saved to {file_path}")
 
 
-    def _save_model(self, model_save_path : str, model_name : str):
-        model_state_dict = self.model.encoder.state_dict()
-        model_file_path = f"{model_save_path}/{model_name}.pth"
-        torch.save(model_state_dict, model_file_path)
-        print(f"Model parameters saved to {model_file_path}")
-
-
-    def _save_dataset_mps(self, dataset_mps_save_path : str):
-        file_path = f"{dataset_mps_save_path}/dataset_MPs.pth"
-        torch.save(self.dataset_MPs, file_path)
-        print(f"Dataset morphological prototypes saved to {file_path}")
+    # def _save_model(self, model_save_path : str, model_name : str):
+    #     model_state_dict = self.model.encoder.state_dict()
+    #     model_file_path = f"{model_save_path}/{model_name}.pth"
+    #     torch.save(model_state_dict, model_file_path)
+    #     print(f"Model parameters saved to {model_file_path}")
+    #
+    #
+    # def _save_dataset_mps(self, dataset_mps_save_path : str):
+    #     file_path = f"{dataset_mps_save_path}/dataset_MPs.pth"
+    #     torch.save(self.dataset_MPs, file_path)
+    #     print(f"Dataset morphological prototypes saved to {file_path}")
 
 
     def train(self)-> None:
@@ -261,11 +325,11 @@ class PrototypeBuilderTrainer:
             self._save_checkpoint(current_epoch=epoch, checkpoints_save_path=checkpoints_save_path)
 
         self.logger.end_train()
-        model_save_path = self.cfg.model_save_path
-        model_name = self.logger.model_name
-        self._save_model(model_save_path, model_name)
-        dataset_mps_save_path = self.cfg.dataset_mps_save_path
-        self._save_dataset_mps(dataset_mps_save_path=dataset_mps_save_path)
+        # model_save_path = self.cfg.model_save_path
+        # model_name = self.logger.model_name
+        # self._save_model(model_save_path, model_name)
+        # dataset_mps_save_path = self.cfg.dataset_mps_save_path
+        # self._save_dataset_mps(dataset_mps_save_path=dataset_mps_save_path)
 
 
 def build_prototype_builder_trainer(
