@@ -328,16 +328,16 @@ class MorphologicalPrototypeGenerator(nn.Module):
         bg_roi_features = self.roi_align(x, bg_boxes)     # [R_bg, C, H, W]
 
         # -----get background prototype-----
-        # # GAP
-        # bg_embeddings = self.gap_bg(bg_roi_features)     # [R_bg, C, 1, 1]
-        # Patch Embed
-        bg_embeddings = self.patch_embed(bg_roi_features)   # [R_bg, Np, D]
+        # GAP
+        bg_embeddings = self.gap_bg(bg_roi_features)     # [R_bg, C, 1, 1]
+        # # Patch Embed
+        # bg_embeddings = self.patch_embed(bg_roi_features)   # [R_bg, Np, D]
         # LogSumExp
-        # bg_embeddings = bg_embeddings.flatten(1)       # [R_bg, C]
-        # bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha     # [C]
-        _, _, D = bg_embeddings.shape
-        bg_embeddings = bg_embeddings.reshape(-1, D)  # [R_bg * Np, D]
-        bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha  # [D]
+        bg_embeddings = bg_embeddings.flatten(1)       # [R_bg, C]
+        bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha     # [C]
+        # _, _, D = bg_embeddings.shape
+        # bg_embeddings = bg_embeddings.reshape(-1, D)  # [R_bg * Np, D]
+        # bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha  # [D]
 
         # -----get CAMs-----
         R, V, C, H, W = aug_roi_features.shape
