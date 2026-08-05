@@ -140,6 +140,7 @@ class VocDataset(Dataset):
             "boxes": ann_boxes_tv,
             "labels": labels_tensor,
             "bg_boxes": bg_boxes_tv,    # could be (0, 4)
+            "image_id": image_id
         }
 
         if self.transforms is not None:
@@ -154,7 +155,6 @@ def build_voc_dataloader(
     target_mode: str,    # target mode, "gt" or "wb"
     batch_size: int,
     transforms: Optional[Callable] = None,      # data transforms
-
 )->DataLoader:
     dataset = VocDataset(dataset_name, split, target_mode, transforms=transforms)
 

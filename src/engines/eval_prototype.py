@@ -1,5 +1,8 @@
-# evaluate engine for Prototype
-# run command: python -m src.engines.eval_prototype --config "src/configs/cfg_prototype_builder.yaml"
+'''
+evaluate engine for Prototype
+run: 
+    python -m src.engines.eval_prototype --config "src/configs/cfg_prototype_builder.yaml"
+'''
 import csv
 from collections import defaultdict
 from datetime import datetime
@@ -25,8 +28,6 @@ def _get_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Training Config")
 
     p.add_argument('--config', type=str, required=True, help='config file path')
-    # # for debug
-    # p.add_argument('--config', default='src/configs/cfg_eval_prototype.yaml', type=str, help='config file path')
 
     return p.parse_args()
 
@@ -182,7 +183,13 @@ def _evaluate_similarity_and_margin(
     with torch.no_grad():
         for _, (images, target) in pbar:
             images = [img.to(device) for img in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in target]
+            targets = [
+                {
+                    k: v.to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in t.items()
+                }
+                for t in target
+            ]
 
             boxes = _build_boxes(targets)
             boxes_labels = _build_boxes_label(targets, num_classes_with_bg)

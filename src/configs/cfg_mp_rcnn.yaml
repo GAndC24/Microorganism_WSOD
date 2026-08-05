@@ -1,0 +1,59 @@
+RUNTIME:
+  SEED: 42
+  DEVICE: "cuda"  # 'cuda' or 'cpu'
+
+
+DATA:
+  DATASET_NAME: "voc_urinary_sediment"
+  BATCH_SIZE: 16
+  # W / H = 4 / 3
+  IMG_W: 384
+  IMG_H: 288
+  NUM_CLASSES: 7
+
+
+MODEL:
+  MODEL_NAME: "MPRCNN"
+
+  # -----for Prototype Builder-----
+  EMBED_DIM: 512
+  HIDDEN_DIM: 4096  # (512, 1024, 2048, 4096)
+  LAYER_INDICES: [8, 22, 29]  # [low, mid, high]
+  PATCH_SIZE: 3   # 2 or 3
+  
+  # -----for RPN-----
+  RPN_ANCHOR_SIZES: [24, 34, 46, 62, 84]  # statistics-based sizes, or [32, 40, 64, 120, 208]
+  RPN_ANCHOR_ASPECT_RATIOS: [0.67, 1.0, 1.5]  # statistics-based ratios, or [0.89, 1.0, 1.15]
+  RPN_FG_IOU_THRESH: 0.6  # [0.5, 0.7]
+  RPN_BG_IOU_THRESH: 0.3  # [0.2, 0.3]
+  RPN_BATCH_SIZE_PER_IMAGE: 256  # [128, 256]
+  RPN_PRE_NMS_TOP_N: [1000, 500]  # train: [2000, 6000], test: [1000, 3000]
+  RPN_POST_NMS_TOP_N: [500, 250] # train: [2000, 4000], test: [1000, 2000]
+  RPN_NMS_THRESH: 0.8  # [0.7, 0.9]
+
+  # -----for RoI Head-----
+  DET_FG_IOU_THRESH: 0.5  # [0.3, 0.5]
+  DET_BG_IOU_THRESH: 0.1  # [0.0, 0.2]
+  DET_BATCH_SIZE_PER_IMAGE: 128  # [128, 256]
+  DET_POSITIVE_FRACTION: 0.25
+  DET_SCORE_THRESH: 0.0   # for training = 0.0, for inference = [0.3, 0.5]
+  DET_NMS_THRESH: 0.5
+  DETECTIONS_PER_IMG: 100
+
+  # ----for RoI Align-----
+  ROI_OUT_SIZE_MID: 21   # 14 or 21, should be divisible by PATCH_SIZE
+  ROI_OUT_SIZE_H2P: 7
+
+
+TRAINER:
+  EPOCHS: 20
+  LR: 0.001
+  WARM_UP_LR_FACTOR: 0.01    # min_lr = warm_up_lr_factor * lr
+  WARMUP_EPOCHS: 2    # 1/10 epochs
+  WEIGHT_DECAY: 0.05    # [0.05, 0.1]
+  MP_EMA_ALPHA: 0.99  # [0.9, 0.99]
+  DATASET_MPS_LOAD_PATH: "results/dataset_morphological_prototypes/dataset_MPs_260625.pth"
+  P_BUILDER_LOAD_PATH: "results/model_weights/prototype_builder_260625.pth"
+  CONTINUE_TRAIN: False
+  # logs/{model_name}_train_log_{start_time}/{model_name}_checkpoints/checkpoint_{epoch}
+  CHECKPOINT_PATH: ""

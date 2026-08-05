@@ -8,3 +8,8 @@ __pycache__/
 /.venv/
 /results/
 /test.py
+/generate_bg_boxes.py
+/docs
+/evidence
+.vscode/
+.agents/

@@ -35,5 +35,4 @@ def build_prototype_builder_config(
         patch_size=cfg['MODEL']['PATCH_SIZE'],
         roi_out_size_mid=cfg['MODEL']['ROI_OUT_SIZE_MID'],
         spatial_scale_mid=spatial_scale_mid,
-        sampling_ratio=cfg['MODEL']['SAMPLING_RATIO']
     )

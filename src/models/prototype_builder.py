@@ -305,7 +305,7 @@ class MorphologicalPrototypeGenerator(nn.Module):
 
     def forward(
         self,
-        x : torch.Tensor,       # middle feature maps, [B, C, H, W]
+        x : torch.Tensor,       # middle feature maps, [B, C2, H2, W2]
         wboxes : torch.Tensor,    # weak boxes, [R=num_wbs, 5], for each box, [batch_idx, x1, y1, x2, y2]
         wb_labels : torch.Tensor,    # class label for weak boxes, [R, num_classes]
         bg_boxes : torch.Tensor,    # background boxes, [R_bg=num_bg_boxes, 5], for each box, [batch_idx, x1, y1, x2, y2]
@@ -328,16 +328,16 @@ class MorphologicalPrototypeGenerator(nn.Module):
         bg_roi_features = self.roi_align(x, bg_boxes)     # [R_bg, C, H, W]
 
         # -----get background prototype-----
-        # # GAP
-        # bg_embeddings = self.gap_bg(bg_roi_features)     # [R_bg, C, 1, 1]
-        # Patch Embed
-        bg_embeddings = self.patch_embed(bg_roi_features)   # [R_bg, Np, D]
+        # GAP
+        bg_embeddings = self.gap_bg(bg_roi_features)     # [R_bg, C, 1, 1]
+        # # Patch Embed
+        # bg_embeddings = self.patch_embed(bg_roi_features)   # [R_bg, Np, D]
         # LogSumExp
-        # bg_embeddings = bg_embeddings.flatten(1)       # [R_bg, C]
-        # bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha     # [C]
-        _, _, D = bg_embeddings.shape
-        bg_embeddings = bg_embeddings.reshape(-1, D)  # [R_bg * Np, D]
-        bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha  # [D]
+        bg_embeddings = bg_embeddings.flatten(1)       # [R_bg, C]
+        bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha     # [C]
+        # _, _, D = bg_embeddings.shape
+        # bg_embeddings = bg_embeddings.reshape(-1, D)  # [R_bg * Np, D]
+        # bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha  # [D]
 
         # -----get CAMs-----
         R, V, C, H, W = aug_roi_features.shape
@@ -452,14 +452,11 @@ class ProtypeBuilder(nn.Module):
         '''
         :return: Similarity of GT and prototypes, {class_id : average_similarity}
         '''
-        # 使用训练阶段一致的 mid feature 提取路径，保证 GT box 特征与原型处于同一投影空间。
         self.hook.clear()
         _ = self.encoder(x)
         feature_maps = self.hook.outputs
-        # mid_feature_maps = feature_maps['mid']
-        # roi_features = self.mp_generator.roi_align(mid_feature_maps, boxes)  # [R, C, H, W]
-        high_feature_maps = feature_maps['high']
-        roi_features = self.mp_generator.roi_align(high_feature_maps, boxes)  # [R, C, H, W]
+        mid_feature_maps = feature_maps['mid']
+        roi_features = self.mp_generator.roi_align(mid_feature_maps, boxes)  # [R, C, H, W]
         patch_features = self.mp_generator.patch_embed(roi_features)  # [R, Np=num_patches, D]
         patch_features = self.projector(patch_features)  # [R, Np, D]
 
@@ -535,9 +532,26 @@ class ProtypeBuilder(nn.Module):
         return out
 
 
+    def get_feature_maps(
+        self,
+        x: torch.Tensor,        # input images, [B, C, H, W]
+    )-> Dict[str, Any]:
+        '''
+        Return:
+            self.hook.outputs(Dict[str, Any]): a dict containing feature maps from different layers of the backbone, keys:
+            - 'low'(torch.Tensor): low-level feature maps, shape [B, C1, H1, W1]
+            - 'mid'(torch.Tensor): mid-level feature maps, shape [B, C2, H2, W2]
+            - 'high'(torch.Tensor): high-level feature maps, shape [B, C3, H3, W3]
+        '''
+        self.hook.clear()
+        _ = self.encoder(x)
+        
+        return self.hook.outputs
+
+
     def forward(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,        # input images, [B, C, H, W]
         wboxes: torch.Tensor,  # weak boxes, [R=num_wbs, 5], for each box, [batch_idx, x1, y1, x2, y2]
         wb_labels: torch.Tensor,  # class label for weak boxes, [R, num_classes]
         bg_boxes: torch.Tensor, # background boxes, [R_bg=num_bg_boxes, 5], for each box, [batch_idx, x1, y1, x2, y2]
@@ -611,4 +625,3 @@ def build_prototype_builder_model(
     )
 
     return ProtypeBuilder(backbone, hook, mp_generator, model_cfg)
-
