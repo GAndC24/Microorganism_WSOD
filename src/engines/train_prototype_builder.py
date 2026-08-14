@@ -1,5 +1,8 @@
-# train engine for Prototype Builder
-# run command: python -m src.engines.train_prototype_builder --config "src/configs/cfg_prototype_builder.yaml"
+'''
+train engine for Prototype Builder
+run: 
+    python -m src.engines.train_prototype_builder --config "src/configs/cfg_prototype_builder.yaml"
+'''
 import torch
 import yaml
 from typing import Dict, Any
@@ -29,8 +32,6 @@ def _get_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Training Config")
 
     p.add_argument('--config', type=str, required=True, help='config file path')
-    # # for debug
-    # p.add_argument('--config', default='src/configs/cfg_prototype_builder.yaml', type=str, help='config file path')
 
     return p.parse_args()
 

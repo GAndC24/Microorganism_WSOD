@@ -9,21 +9,7 @@ import torch.nn.functional as F
 
 from .configs.cfg_trainer_prototype_builder import PrototypeBuilderTrainerConfig, build_prototype_builder_trainer_config
 from ..losses.loss_funcs import get_constrain_loss, get_sep_loss
-
-
-def _build_image_multi_hot(targets: List[Dict[str, torch.Tensor]], num_classes: int) -> torch.Tensor:
-    """
-    construct multi-hot labels for a batch of images
-    :param targets: image annotations
-    :param num_classes : number of classes
-    :return: labels : multi-hot tensor, [B, num_classes]
-    """
-    labels = torch.zeros((len(targets), num_classes), dtype=torch.float32)
-    for idx, target in enumerate(targets):
-        if target["labels"].numel() == 0:
-            continue
-        labels[idx, target["labels"].unique()] = 1.0
-    return labels
+from ..vis_cams import visualize_cams
 
 
 def _build_wb_one_hot(targets: List[Dict[str, torch.Tensor]], num_classes: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -57,21 +43,6 @@ def _build_wboxes(targets: List[Dict[str, torch.Tensor]]) -> torch.Tensor:
         wboxes.append(torch.cat([batch_indices, boxes], dim=1))  # Combine batch_idx with boxes
 
     return torch.cat(wboxes, dim=0)  # Concatenate all boxes across the batch
-
-
-def _build_bg_boxes(targets: List[Dict[str, torch.Tensor]]) -> torch.Tensor:
-    """
-    Construct background boxes tensor from targets.
-    :param targets: List of dictionaries containing bounding box information.
-    :return: bg_boxes tensor of shape [B, 5], where each box is [batch_idx, x1, y1, x2, y2].
-    """
-    bg_boxes = []
-    for batch_idx, target in enumerate(targets):
-        boxes = target["bg_boxes"]
-        batch_indices = torch.full((boxes.size(0), 1), batch_idx, dtype=boxes.dtype, device=boxes.device)
-        bg_boxes.append(torch.cat([batch_indices, boxes], dim=1))
-
-    return torch.cat(bg_boxes, dim=0)  # Concatenate all background boxes across the batch
 
 
 class PrototypeBuilderTrainer:
@@ -183,14 +154,19 @@ class PrototypeBuilderTrainer:
         }
         for iter, (images, target) in pbar:
             images = [img.to(self.cfg.device) for img in images]
-            targets = [{k: v.to(self.cfg.device) for k, v in t.items()} for t in target]
+            targets = [
+                {
+                    k: v.to(self.cfg.device) if isinstance(v, torch.Tensor) else v
+                    for k, v in t.items()
+                }
+                for t in target
+            ]
 
             wboxes = _build_wboxes(targets).to(self.cfg.device)
-            bg_boxes = _build_bg_boxes(targets).to(self.cfg.device)
             wb_one_hot_labels, all_labels = _build_wb_one_hot(targets, self.cfg.num_classes)
             wb_one_hot_labels, all_labels = wb_one_hot_labels.to(self.cfg.device), all_labels.to(self.cfg.device)
             X = torch.stack(images, dim=0)
-            out = self.model(X, wboxes, wb_one_hot_labels, bg_boxes)
+            out = self.model(X, wboxes, wb_one_hot_labels)
 
             if epoch == 1:
                 self._update_dataset_mps_ema(out['prototypes'])
@@ -252,6 +228,20 @@ class PrototypeBuilderTrainer:
                 "lr": f"{self.optimizer.param_groups[0]['lr']}",
             })
 
+            # # debug: visualize CAMs
+            # visualize_cams(
+            #     cams=self.model.mp_generator.cams,
+            #     targets=targets,
+            #     wb_one_hot_labels=wb_one_hot_labels,
+            #     canvas_sizes=[
+            #         tuple(int(value) for value in image.shape[-2:])
+            #         for image in images
+            #     ],
+            #     epoch=epoch,
+            #     iter=iter,
+            # )
+
+
         self.lr_scheduler.step()
 
         num_iters = len(self.train_loader)
@@ -265,15 +255,15 @@ class PrototypeBuilderTrainer:
         average_sep_bg_loss = epoch_losses['sep_bg'] / num_iters
 
         self.logger.add_info(
-            f"Epoch [{epoch}/{self.cfg.epochs}]"
-            f"Total Loss: {average_total_loss:.4f}, "
+            f"Epoch [{epoch}/{self.cfg.epochs}]\n"
+            f"  Total Loss: {average_total_loss:.4f} | "
             f"CAM Loss: {average_cam_loss:.4f}\n"
-            f"Constrain Loss: {average_constrain_loss:.4f} "
-            f"Constrain SupCon Loss : {average_constrain_supcon_loss:.4f} "
-            f"Constrain Proto Loss : {average_constrain_proto_loss:.4f} \n"
-            f"Sep Loss: {average_sep_loss:.4f} "
-            f"Sep FG Loss: {average_sep_fg_loss:.4f}"
-            f"Sep BG Loss: {average_sep_bg_loss:.4f}"
+            f"  Constrain Loss: {average_constrain_loss:.4f} | "
+            f"SupCon Loss: {average_constrain_supcon_loss:.4f} | "
+            f"Proto Loss: {average_constrain_proto_loss:.4f}\n"
+            f"  Sep Loss: {average_sep_loss:.4f} | "
+            f"FG Loss: {average_sep_fg_loss:.4f} | "
+            f"BG Loss: {average_sep_bg_loss:.4f}\n\n"
         )
         metrics = {
             'Epoch': epoch,
@@ -304,19 +294,6 @@ class PrototypeBuilderTrainer:
         print(f"Checkpoint saved to {file_path}")
 
 
-    # def _save_model(self, model_save_path : str, model_name : str):
-    #     model_state_dict = self.model.encoder.state_dict()
-    #     model_file_path = f"{model_save_path}/{model_name}.pth"
-    #     torch.save(model_state_dict, model_file_path)
-    #     print(f"Model parameters saved to {model_file_path}")
-    #
-    #
-    # def _save_dataset_mps(self, dataset_mps_save_path : str):
-    #     file_path = f"{dataset_mps_save_path}/dataset_MPs.pth"
-    #     torch.save(self.dataset_MPs, file_path)
-    #     print(f"Dataset morphological prototypes saved to {file_path}")
-
-
     def train(self)-> None:
         for epoch in range(self.start_epoch, self.cfg.epochs + 1):
             self.model.train()
@@ -325,11 +302,6 @@ class PrototypeBuilderTrainer:
             self._save_checkpoint(current_epoch=epoch, checkpoints_save_path=checkpoints_save_path)
 
         self.logger.end_train()
-        # model_save_path = self.cfg.model_save_path
-        # model_name = self.logger.model_name
-        # self._save_model(model_save_path, model_name)
-        # dataset_mps_save_path = self.cfg.dataset_mps_save_path
-        # self._save_dataset_mps(dataset_mps_save_path=dataset_mps_save_path)
 
 
 def build_prototype_builder_trainer(

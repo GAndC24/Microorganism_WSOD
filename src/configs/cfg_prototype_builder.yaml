@@ -28,7 +28,7 @@ TRAINER:
   WEIGHT_DECAY: 0.05    # [0.05, 0.1]
   MODEL_SAVE_PATH: "results/model_weights/"
   DATASET_MPS_SAVE_PATH: "results/dataset_morphological_prototypes/"
-  CONTINUE_TRAIN: false
+  CONTINUE_TRAIN: False
   # logs/{model_name}_train_log_{start_time}/{model_name}_checkpoints/checkpoint_{epoch}
   CHECKPOINT_PATH: ""
   W_CAM_LOSS: 0.8   # [0.1, 1.0]
@@ -39,3 +39,4 @@ TRAINER:
 EVAL:
   # for eval prototypes
   LOAD_CHECKPOINT_PATH: "logs/PrototypeBuilder_train_log_2026-06-25_12-11-59/PrototypeBuilder_checkpoints/checkpoint_40.pth"
+  BG_BOXES_PATH: "data/processed/Urinary Sediment Dataset/bg_boxes.pth" 

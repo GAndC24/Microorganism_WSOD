@@ -164,7 +164,6 @@ class FeatureMapTransform(nn.Module):
 
 
 # -----Morphological Prototype Generator-----
-# use GMM for anchor
 class MorphologicalPrototypeGenerator(nn.Module):
     def __init__(
         self,
@@ -303,13 +302,35 @@ class MorphologicalPrototypeGenerator(nn.Module):
         return proto_dict
 
 
+    def _get_background_prototype(
+        self,
+        patch_features : torch.Tensor,      # [R, Np, D]
+        patch_fg_bg_scores : torch.Tensor,  # [R, Np, 2]
+        top_k_ratio : float = 0.05,
+    )-> torch.Tensor:
+        '''
+        Return:
+            bg_prototype(torch.Tensor): background prototype, [D]
+        '''
+        # Get the top-k patches with the highest background scores
+        k = int(patch_fg_bg_scores.shape[1] * top_k_ratio)
+        _, top_k_indices = torch.topk(patch_fg_bg_scores[:, :, 1], k=k, dim=1)
+        # Select the corresponding patch features
+        bg_patch_features = patch_features.gather(1, top_k_indices.unsqueeze(-1).expand(-1, -1, patch_features.shape[-1]))  # [R, k, D]
+        R, k, D = bg_patch_features.shape
+        bg_patch_features = bg_patch_features.reshape(R * k, D)  # [R * k, D]
+        # Compute the mean of the selected background patch features
+        bg_prototype = bg_patch_features.mean(dim=0)  # [D]
+
+        return bg_prototype
+
+
     def forward(
         self,
         x : torch.Tensor,       # middle feature maps, [B, C2, H2, W2]
         wboxes : torch.Tensor,    # weak boxes, [R=num_wbs, 5], for each box, [batch_idx, x1, y1, x2, y2]
         wb_labels : torch.Tensor,    # class label for weak boxes, [R, num_classes]
-        bg_boxes : torch.Tensor,    # background boxes, [R_bg=num_bg_boxes, 5], for each box, [batch_idx, x1, y1, x2, y2]
-        lse_alpha : float = 10.0    # LSE alpha
+        lse_alpha : float = 10.0    # LSE alpha = 1 / tau, inverse temperature
     )-> Dict[str, Any]:
         """
         :return:
@@ -324,20 +345,7 @@ class MorphologicalPrototypeGenerator(nn.Module):
         roi_features = self.roi_align(x, wboxes)       # [R, C, H, W]
         # aug_roi_features = self.feature_transform(roi_features.detach())  # [R, V, C, H, W]
         aug_roi_features = self.feature_transform(roi_features)  # [R, V, C, H, W]
-        # background features
-        bg_roi_features = self.roi_align(x, bg_boxes)     # [R_bg, C, H, W]
 
-        # -----get background prototype-----
-        # GAP
-        bg_embeddings = self.gap_bg(bg_roi_features)     # [R_bg, C, 1, 1]
-        # # Patch Embed
-        # bg_embeddings = self.patch_embed(bg_roi_features)   # [R_bg, Np, D]
-        # LogSumExp
-        bg_embeddings = bg_embeddings.flatten(1)       # [R_bg, C]
-        bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha     # [C]
-        # _, _, D = bg_embeddings.shape
-        # bg_embeddings = bg_embeddings.reshape(-1, D)  # [R_bg * Np, D]
-        # bg_prototype = torch.logsumexp(lse_alpha * bg_embeddings, dim=0) / lse_alpha  # [D]
 
         # -----get CAMs-----
         R, V, C, H, W = aug_roi_features.shape
@@ -349,30 +357,31 @@ class MorphologicalPrototypeGenerator(nn.Module):
             'loss_cam' : loss_cam,
         })
 
+
         # -----patch embed-----
         patch_features = self.patch_embed(
             aug_roi_features
         ).view(RV, -1, self.embed_dim)     # [R * V, Np=num_patches, D]
-        _, Np, D = patch_features.shape
+        D = patch_features.shape[2]
 
-        # -----get contrast patch features for loss_pull-----
-        # get fg & bg scores for each patch
-        patch_fg_bg_scores = self._cam_to_patch_fg_bg_scores(cams, expand_wb_labels)      # [R * V, Np, 2], fg_scores = [:, :, 0], bg_scores = [:, :, 1]
-        # select top-k patches based on fg scores
-        top_k_ratio = 0.25      # [0.2, 0.3]
-        k = int(max(1, Np * top_k_ratio))
-        topk_fg_scores, topk_indices = torch.topk(patch_fg_bg_scores[:, :, 0], k=k, dim=1)    # [R * V, k]
-        patch_indices = torch.arange(RV, device=x.device).unsqueeze(1).expand(-1, k)    # [R * V, k]
-        topk_patch_features = patch_features[patch_indices, topk_indices]    # [R * V, k, D]
+
+        # -----get contrast patch features for loss_constrain_supcon-----
         # LogSumExp for top-k patch features
-        x_lse = lse_alpha * topk_patch_features  # [R * V, k, D]
-        contrast_patch_features = torch.logsumexp(x_lse, dim=1) / lse_alpha   # [R * V, D]
-        contrast_patch_features = contrast_patch_features.view(R, V, D)     # for SupCon format, [R, V, D]
+        x_lse = lse_alpha * patch_features  # [R * V, Np, D]
+        contrast_patch_features_lse = torch.logsumexp(x_lse, dim=1) / lse_alpha   # [R * V, D]
+        # # mean pooling for contrast patch features
+        # contrast_patch_features_mean = patch_features.mean(dim=1)  # [R * V, D]
+        contrast_patch_features = contrast_patch_features_lse.view(R, V, D)     # for SupCon format, [R, V, D]
         out.update({
             'contrast_patch_features' : contrast_patch_features
         })
 
+
         # -----get morphological prototypes-----
+        # get fg & bg scores for each patch
+        patch_fg_bg_scores = self._cam_to_patch_fg_bg_scores(cams, expand_wb_labels)      # [R * V, Np, 2], fg_scores = [:, :, 0], bg_scores = [:, :, 1]
+        # build background prototype
+        bg_prototype = self._get_background_prototype(patch_features, patch_fg_bg_scores)  # [D]
         # get anchor feature of each weak box
         anchor_features_list : List[torch.Tensor] = []
         for i in range(RV):
@@ -554,7 +563,6 @@ class ProtypeBuilder(nn.Module):
         x: torch.Tensor,        # input images, [B, C, H, W]
         wboxes: torch.Tensor,  # weak boxes, [R=num_wbs, 5], for each box, [batch_idx, x1, y1, x2, y2]
         wb_labels: torch.Tensor,  # class label for weak boxes, [R, num_classes]
-        bg_boxes: torch.Tensor, # background boxes, [R_bg=num_bg_boxes, 5], for each box, [batch_idx, x1, y1, x2, y2]
     )-> Dict[str, Any]:
         """
         :return:
@@ -576,8 +584,7 @@ class ProtypeBuilder(nn.Module):
         mp_g_out = self.mp_generator(
             mid_feature_maps,
             wboxes,
-            wb_labels,
-            bg_boxes,
+            wb_labels
         )
 
         # -----projection-----
