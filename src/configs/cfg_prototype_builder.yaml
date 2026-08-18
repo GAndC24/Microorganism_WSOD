@@ -21,10 +21,10 @@ MODEL:
   SAMPLING_RATIO: 2
 
 TRAINER:
-  EPOCHS: 40
+  EPOCHS: 30
   LR: 0.001
   WARM_UP_LR_FACTOR: 0.01    # min_lr = warm_up_lr_factor * lr
-  WARMUP_EPOCHS: 4    # 1/10 epochs
+  WARMUP_EPOCHS: 3    # 1/10 epochs
   WEIGHT_DECAY: 0.05    # [0.05, 0.1]
   MODEL_SAVE_PATH: "results/model_weights/"
   DATASET_MPS_SAVE_PATH: "results/dataset_morphological_prototypes/"
@@ -38,5 +38,5 @@ TRAINER:
 
 EVAL:
   # for eval prototypes
-  LOAD_CHECKPOINT_PATH: "logs/PrototypeBuilder_train_log_2026-06-25_12-11-59/PrototypeBuilder_checkpoints/checkpoint_40.pth"
-  BG_BOXES_PATH: "data/processed/Urinary Sediment Dataset/bg_boxes.pth" 
+  LOAD_CHECKPOINT_PATH: "logs/PrototypeBuilder_train_log_2026-08-17_11-45-58/PrototypeBuilder_checkpoints/checkpoint_30.pth"
+  BG_BATCH_SIZE: 32

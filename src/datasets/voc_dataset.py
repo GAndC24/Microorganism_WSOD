@@ -59,6 +59,7 @@ class VocDataset(Dataset):
         split: str,       # dataset split, "train" or "val" or "test"
         target_mode: str,    # target mode, "gt" or "wb"
         transforms: Optional[Callable] = None,      # data transforms
+        use_bg_boxes: bool = False,   # 是否加载背景框
     )-> None:
         super().__init__()
 
@@ -93,6 +94,16 @@ class VocDataset(Dataset):
         with open(imageset_txt, "r", encoding="utf-8") as f:
             self.img_ids = [line.strip() for line in f.readlines() if line.strip()]
 
+        self.bg_boxes = None
+        if use_bg_boxes:
+            if "bg_boxes" not in self.dataset_info:
+                raise KeyError(f"数据集 {dataset_name} 未配置 bg_boxes。")
+            self.bg_boxes = torch.load(
+                self.dataset_info["bg_boxes"],
+                map_location="cpu",
+                weights_only=True,
+            )
+
 
     def __len__(self) -> int:
         return len(self.img_ids)
@@ -118,19 +129,28 @@ class VocDataset(Dataset):
 
         ann_boxes_tensor = torch.tensor(ann_boxes, dtype=torch.float32)  # [N,4]
         labels_tensor = torch.tensor(labels, dtype=torch.int64)  # [N]
-
         image = tv_tensors.Image(image_pil)
         ann_boxes_tv = tv_tensors.BoundingBoxes(
             ann_boxes_tensor,
             format="XYXY",
             canvas_size=(H, W)
         )
-
         target: Dict[str, Any] = {
             "boxes": ann_boxes_tv,
             "labels": labels_tensor,
             "image_id": image_id
         }
+
+        if self.bg_boxes is not None:
+            records = self.bg_boxes.get("records", {})
+            if image_id not in records:
+                raise KeyError(f"背景框文件中缺少图像 {image_id} 的记录。")
+            bg_boxes_tensor = records[image_id]["boxes"].reshape(-1, 4).to(dtype=torch.float32)
+            target["bg_boxes"] = tv_tensors.BoundingBoxes(
+                bg_boxes_tensor,
+                format="XYXY",
+                canvas_size=(H, W),
+            )
 
         if self.transforms is not None:
             image, target = self.transforms(image, target)
@@ -144,8 +164,15 @@ def build_voc_dataloader(
     target_mode: str,    # target mode, "gt" or "wb"
     batch_size: int,
     transforms: Optional[Callable] = None,      # data transforms
+    use_bg_boxes: bool = False,   # 是否加载背景框
 )->DataLoader:
-    dataset = VocDataset(dataset_name, split, target_mode, transforms=transforms)
+    dataset = VocDataset(
+        dataset_name,
+        split,
+        target_mode,
+        transforms=transforms,
+        use_bg_boxes=use_bg_boxes,
+    )
 
     if split == "train":
         shuffle = True

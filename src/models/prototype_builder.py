@@ -451,16 +451,19 @@ class ProtypeBuilder(nn.Module):
     def eval_prototype(
         self,
         x: torch.Tensor,  # input images, [B, C, H, W]
-        boxes: torch.Tensor,  # GT boxes for RoI Align, [R=num_gt_boxes, 5], for each box, [batch_idx, x1, y1, x2, y2]
-        boxes_labels: torch.Tensor,  # class labels for GT boxes, [R, num_classes]
+        boxes: torch.Tensor,  # 待评估框，[R, 5]，每行为 [batch_idx, x1, y1, x2, y2]
+        boxes_labels: torch.Tensor,  # 待评估框的类别标签，[R, num_classes]
         prototypes: Dict[int, torch.Tensor],  # raw, {class_id, prototype tensor}
         return_details: bool = True,
         lse_alpha: float = 10.0,
-        lse_eps: float = 1e-6
+        lse_eps: float = 1e-6,
+        positive_only: bool = False,
     ) -> Dict[str, Any]:
-        '''
-        :return: Similarity of GT and prototypes, {class_id : average_similarity}
-        '''
+        """评估框特征与对应类别原型的相似度。
+
+        positive_only=True 时计算每个框与所有类别原型的 positive similarity，
+        不计算负类相似度、margin 等其他指标，用于背景框评估。
+        """
         self.hook.clear()
         _ = self.encoder(x)
         feature_maps = self.hook.outputs
@@ -483,53 +486,63 @@ class ProtypeBuilder(nn.Module):
         sims_sum = {k: 0.0 for k in range(num_classes)}
         sims_cnt = {k: 0 for k in range(num_classes)}
 
-        # statistics: results details
         details = {
-            "pos": {k: [] for k in range(num_classes)},  # sim_pos of each GT
-            "neg_max": {k: [] for k in range(num_classes)},  # max sim_neg of each GT
-            "margin": {k: [] for k in range(num_classes)},  # margin = sim_pos - max sim_neg
-            "bg": {k: [] for k in range(num_classes)},  # 每个 GT box 与背景原型的相似度
+            "pos": {k: [] for k in range(num_classes)},
         }
+        if not positive_only:
+            details.update({
+                "neg_max": {k: [] for k in range(num_classes)},  # 最大负类相似度
+                "margin": {k: [] for k in range(num_classes)},  # 正类与最大负类的间隔
+                "bg": {k: [] for k in range(num_classes)},  # 与背景原型的相似度
+            })
 
         for i in range(R):
-            gt_label = torch.argmax(boxes_labels[i]).item()
-
-            gt_patch = patch_features[i]  # [num_patches, D]
-            gt_patch = F.normalize(gt_patch, dim=1)
+            box_patch = patch_features[i]  # [num_patches, D]
+            box_patch = F.normalize(box_patch, dim=1)
 
             # # mean pooling
-            # gt_vec = gt_patch.mean(dim=0, keepdim=True)  # [1, D]
-            # gt_vec = F.normalize(gt_vec, dim=1)  # [1, D]
+            # box_vec = box_patch.mean(dim=0, keepdim=True)  # [1, D]
+            # box_vec = F.normalize(box_vec, dim=1)  # [1, D]
 
             # LogSumExp pooling
-            m = gt_patch.max(dim=0, keepdim=True).values  # [1, D]
-            lse = m + torch.log(torch.exp(lse_alpha * (gt_patch - m)).mean(dim=0, keepdim=True) + lse_eps) / lse_alpha
-            gt_vec = F.normalize(lse, dim=1, eps=lse_eps)  # [1, D]
+            m = box_patch.max(dim=0, keepdim=True).values  # [1, D]
+            lse = m + torch.log(torch.exp(lse_alpha * (box_patch - m)).mean(dim=0, keepdim=True) + lse_eps) / lse_alpha
+            box_vec = F.normalize(lse, dim=1, eps=lse_eps)  # [1, D]
 
-            # similarity of GT and prototypes(all classes)
-            sims_all = torch.matmul(gt_vec, proto_mat.t()).squeeze(0)  # [num_classes]
+            if positive_only:
+                sims_all = torch.matmul(box_vec, proto_mat.t()).squeeze(0)
+                for class_id in range(num_classes):
+                    sim_pos = sims_all[class_id].item()
+                    sims_sum[class_id] += sim_pos
+                    sims_cnt[class_id] += 1
+                    if return_details:
+                        details["pos"][class_id].append(sim_pos)
+                continue
 
-            sim_pos = sims_all[gt_label].item()  # positive class similarity
+            box_label = torch.argmax(boxes_labels[i]).item()
+            sims_all = torch.matmul(box_vec, proto_mat.t()).squeeze(0)  # [num_classes]
+            sim_pos = sims_all[box_label].item()
+            sims_sum[box_label] += sim_pos
+            sims_cnt[box_label] += 1
+            if return_details:
+                details["pos"][box_label].append(sim_pos)
+
             sim_bg = sims_all[0].item() if 0 in class_ids else float("nan")
 
             # max negative class similarity
             if num_classes > 1:
                 mask = torch.ones(num_classes, dtype=torch.bool, device=sims_all.device)
-                mask[gt_label] = False
+                mask[box_label] = False
                 sim_neg_max = sims_all[mask].max().item()
             else:
                 sim_neg_max = float("-inf")
 
             margin = sim_pos - sim_neg_max if sim_neg_max != float("-inf") else float("inf")
 
-            sims_sum[gt_label] += sim_pos
-            sims_cnt[gt_label] += 1
-
             if return_details:
-                details["pos"][gt_label].append(sim_pos)
-                details["neg_max"][gt_label].append(sim_neg_max)
-                details["margin"][gt_label].append(margin)
-                details["bg"][gt_label].append(sim_bg)
+                details["neg_max"][box_label].append(sim_neg_max)
+                details["margin"][box_label].append(margin)
+                details["bg"][box_label].append(sim_bg)
 
         out = {
             "sum": sims_sum,

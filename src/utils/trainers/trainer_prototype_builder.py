@@ -108,28 +108,72 @@ class PrototypeBuilderTrainer:
 
 
     @torch.no_grad()
-    def _update_dataset_mps_ema(self, batch_prototypes: Dict[int, torch.Tensor]) -> None:
-        if (batch_prototypes is None) or (len(batch_prototypes) == 0):
-            return
-        alpha = float(self.cfg.mp_ema_alpha)
-        for cls_id, p_new in batch_prototypes.items():
-            if p_new is None:
+    def _initialize_missing_dataset_mps(
+        self,
+        batch_prototypes: Dict[int, torch.Tensor],
+    ) -> None:
+        """为尚未出现的类别建立零占位，避免写入无效 projector 输出。"""
+        expected_keys = set(range(self.cfg.num_classes + 1))
+        batch_prototypes_by_id = {
+            int(class_id): prototype
+            for class_id, prototype in batch_prototypes.items()
+        }
+        actual_keys = set(batch_prototypes_by_id)
+        if actual_keys != expected_keys:
+            raise ValueError(
+                f"batch 原型 key 应为 {sorted(expected_keys)}，实际为 {sorted(actual_keys)}。"
+            )
+
+        for class_id in sorted(expected_keys):
+            if class_id in self.dataset_MPs:
                 continue
 
-            key = cls_id
+            prototype = batch_prototypes_by_id[class_id]
+            if prototype is None:
+                raise ValueError(f"类别 {class_id} 的 batch 原型不能为空。")
+
+            self.dataset_MPs[class_id] = torch.zeros_like(
+                prototype.detach(),
+                device=self.cfg.device,
+            )
+
+
+    @torch.no_grad()
+    def _update_dataset_mps_ema(
+        self,
+        batch_prototypes: Dict[int, torch.Tensor],
+        valid_class_ids: torch.Tensor,
+    ) -> None:
+        if (batch_prototypes is None) or (len(batch_prototypes) == 0):
+            return
+
+        valid_foreground_ids = {
+            int(class_id)
+            for class_id in valid_class_ids.detach().flatten().cpu().tolist()
+        }
+        expected_foreground_ids = set(range(1, self.cfg.num_classes + 1))
+        invalid_ids = valid_foreground_ids - expected_foreground_ids
+        if invalid_ids:
+            raise ValueError(f"有效前景类别超出范围：{sorted(invalid_ids)}。")
+
+        self._initialize_missing_dataset_mps(batch_prototypes)
+
+        # 背景始终更新；前景只更新当前 batch 实际出现的类别。
+        update_class_ids = {0, *valid_foreground_ids}
+        alpha = float(self.cfg.mp_ema_alpha)
+        for cls_id, p_new in batch_prototypes.items():
+            key = int(cls_id)
+            if key not in update_class_ids:
+                continue
+            if p_new is None:
+                raise ValueError(f"类别 {key} 的 batch 原型不能为空。")
+
             p_new = p_new.detach().to(self.cfg.device)
-            p_new = torch.nn.functional.normalize(p_new, dim=-1, eps=1e-6)
+            p_new = F.normalize(p_new, dim=-1, eps=1e-6)
+            p_old = self.dataset_MPs[key].detach().to(self.cfg.device)
 
-            if key not in self.dataset_MPs:
-                self.dataset_MPs[key] = p_new
-            else:
-                p_old = self.dataset_MPs[key].to(self.cfg.device)
-                p_old = p_old.detach()
-
-                p_updated = alpha * p_old + (1.0 - alpha) * p_new
-                p_updated = torch.nn.functional.normalize(p_updated, dim=-1, eps=1e-6)
-
-                self.dataset_MPs[key] = p_updated
+            p_updated = alpha * p_old + (1.0 - alpha) * p_new
+            self.dataset_MPs[key] = F.normalize(p_updated, dim=-1, eps=1e-6)
 
 
     def _train_one_epoch(self, epoch) -> None:
@@ -167,19 +211,27 @@ class PrototypeBuilderTrainer:
             wb_one_hot_labels, all_labels = wb_one_hot_labels.to(self.cfg.device), all_labels.to(self.cfg.device)
             X = torch.stack(images, dim=0)
             out = self.model(X, wboxes, wb_one_hot_labels)
+            valid_class_ids = all_labels.unique() + 1
 
             if epoch == 1:
-                self._update_dataset_mps_ema(out['prototypes'])
+                self._update_dataset_mps_ema(
+                    out['prototypes'],
+                    valid_class_ids=valid_class_ids,
+                )
 
             dataset_prototypes_dict = self.dataset_MPs
             proto_keys = sorted(dataset_prototypes_dict.keys())
             expected_proto_keys = list(range(self.cfg.num_classes + 1))
             if proto_keys != expected_proto_keys:
                 raise ValueError(f"原型 key 应为 {expected_proto_keys}，实际为 {proto_keys}。")
-            dataset_prototypes = torch.stack([dataset_prototypes_dict[k] for k in proto_keys], dim=0)  # [num_classes + 1, D]
-            dataset_prototypes_norm = F.normalize(dataset_prototypes, dim=-1)
-            for idx, key in enumerate(proto_keys):
-                dataset_prototypes_dict[key] = dataset_prototypes_norm[idx]
+            dataset_prototypes_dict = {
+                key: F.normalize(
+                    dataset_prototypes_dict[key].detach().to(self.cfg.device),
+                    dim=-1,
+                    eps=1e-6,
+                )
+                for key in proto_keys
+            }
             contrast_patch_features_norm = F.normalize(out['contrast_patch_features'], dim=-1)
             loss_constrain_dict = get_constrain_loss(
                 contrast_patch_features_norm,
@@ -192,11 +244,10 @@ class PrototypeBuilderTrainer:
                 dataset_prototypes_dict[key] = dataset_prototypes_dict[key].detach()
                 batch_prototype = F.normalize(out['prototypes'][key], dim=-1)
                 batch_prototypes_dict[key] = batch_prototype
-            valid_fg_class_ids = all_labels.unique() + 1
             loss_sep_dict = get_sep_loss(
                 dataset_prototypes=dataset_prototypes_dict,
                 batch_prototypes=batch_prototypes_dict,
-                valid_fg_class_ids=valid_fg_class_ids,
+                valid_fg_class_ids=valid_class_ids,
             )
 
             loss = (self.cfg.w_cam_loss * out['loss_cam'] +
@@ -204,7 +255,10 @@ class PrototypeBuilderTrainer:
                     self.cfg.w_sep_loss * loss_sep_dict['loss_sep'])
 
             if epoch > 1:
-                self._update_dataset_mps_ema(out['prototypes'])
+                self._update_dataset_mps_ema(
+                    out['prototypes'],
+                    valid_class_ids=valid_class_ids,
+                )
 
             self.optimizer.zero_grad()
             loss.backward()

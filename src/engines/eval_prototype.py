@@ -87,23 +87,26 @@ def _load_prototypes(
     return {int(k): v.to(device) for k, v in prototypes.items()}
 
 
-def _build_boxes(targets: List[Dict[str, torch.Tensor]]) -> torch.Tensor:
+def _build_boxes(
+    targets: List[Dict[str, torch.Tensor]],
+    box_key: str = "boxes",
+) -> torch.Tensor:
     """
-    从 targets 构造 RoIAlign 需要的 GT box 张量。
+    从 targets 构造 RoIAlign 需要的框张量。
     :return: [R, 5]，每行格式为 [batch_idx, x1, y1, x2, y2]
     """
-    gt_boxes = []
+    roi_boxes = []
     for batch_idx, target in enumerate(targets):
-        boxes = target["boxes"]
+        boxes = target[box_key]
         if boxes.numel() == 0:
             continue
         batch_indices = torch.full((boxes.size(0), 1), batch_idx, dtype=boxes.dtype, device=boxes.device)
-        gt_boxes.append(torch.cat([batch_indices, boxes], dim=1))
+        roi_boxes.append(torch.cat([batch_indices, boxes], dim=1))
 
-    if not gt_boxes:
-        device = targets[0]["boxes"].device if targets else torch.device("cpu")
+    if not roi_boxes:
+        device = targets[0][box_key].device if targets else torch.device("cpu")
         return torch.empty((0, 5), dtype=torch.float32, device=device)
-    return torch.cat(gt_boxes, dim=0)
+    return torch.cat(roi_boxes, dim=0)
 
 
 def _build_boxes_label(targets: List[Dict[str, torch.Tensor]], num_classes_with_bg: int) -> torch.Tensor:
@@ -126,6 +129,22 @@ def _build_boxes_label(targets: List[Dict[str, torch.Tensor]], num_classes_with_
     one_hot_labels = torch.zeros((all_labels.size(0), num_classes_with_bg), dtype=torch.float32, device=all_labels.device)
     one_hot_labels.scatter_(1, all_labels.unsqueeze(1), 1.0)
     return one_hot_labels
+
+
+def _build_bg_boxes_label(
+    num_boxes: int,
+    num_classes_with_bg: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """为背景框构造类别 0 的 one-hot 标签。"""
+    labels = torch.zeros(
+        (num_boxes, num_classes_with_bg),
+        dtype=torch.float32,
+        device=device,
+    )
+    if num_boxes > 0:
+        labels[:, 0] = 1.0
+    return labels
 
 
 def _safe_stats(values: List[float]) -> Dict[str, float]:
@@ -154,7 +173,7 @@ def _plot_hist(values: List[float], title: str, xlabel: str, save_path: Path) ->
     plt.close()
 
 
-def _evaluate_similarity_and_margin(
+def _evaluate_gt_similarity_and_margin(
     model: torch.nn.Module,
     loader,
     prototypes: Dict[int, torch.Tensor],
@@ -264,6 +283,89 @@ def _evaluate_similarity_and_margin(
     return mean_pos, global_cnt, csv_path, save_dir
 
 
+def _evaluate_bg_positive_similarity(
+    model: torch.nn.Module,
+    loader,
+    prototypes: Dict[int, torch.Tensor],
+    num_classes_with_bg: int,
+    device: torch.device,
+    save_dir: Path,
+    split_name: str,
+):
+    """仅评估背景框与所有类别原型之间的 positive similarity。"""
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    similarity_sum = {k: 0.0 for k in range(num_classes_with_bg)}
+    box_count = {k: 0 for k in range(num_classes_with_bg)}
+    positive_similarities = defaultdict(list)
+
+    model.eval()
+    pbar = tqdm(
+        enumerate(loader, start=1),
+        total=len(loader),
+        desc=f"Computing {split_name} background boxes",
+        leave=False,
+        dynamic_ncols=True,
+    )
+    with torch.no_grad():
+        for _, (images, target) in pbar:
+            images = [img.to(device) for img in images]
+            targets = [
+                {
+                    k: v.to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in t.items()
+                }
+                for t in target
+            ]
+
+            boxes = _build_boxes(targets, box_key="bg_boxes")
+            if boxes.size(0) == 0:
+                continue
+            boxes_labels = _build_bg_boxes_label(
+                num_boxes=boxes.size(0),
+                num_classes_with_bg=num_classes_with_bg,
+                device=boxes.device,
+            )
+
+            x = torch.stack(images, dim=0)
+            out = model.eval_prototype(
+                x,
+                boxes,
+                boxes_labels,
+                prototypes,
+                return_details=True,
+                positive_only=True,
+            )
+            for k in range(num_classes_with_bg):
+                similarity_sum[k] += float(out["sum"][k])
+                box_count[k] += int(out["cnt"][k])
+                positive_similarities[k].extend(out["details"]["pos"][k])
+
+    mean_positive_similarity = {
+        k: similarity_sum[k] / box_count[k] if box_count[k] > 0 else 0.0
+        for k in range(num_classes_with_bg)
+    }
+    csv_path = save_dir / f"{split_name}_bg_proto_stats.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["class_id", "cnt", "mean_pos"])
+        for k in range(num_classes_with_bg):
+            writer.writerow([k, box_count[k], mean_positive_similarity[k]])
+
+    for k in range(num_classes_with_bg):
+        _plot_hist(
+            positive_similarities[k],
+            (
+                f"{split_name} Background Boxes vs Class {k} Prototype "
+                f"- sim_pos distribution (cnt={box_count[k]})"
+            ),
+            "cosine(sim_pos)",
+            save_dir / f"{split_name}_bg_class{k}_pos_hist.png",
+        )
+
+    return mean_positive_similarity, box_count, csv_path, save_dir
+
+
 def eval(config_path: str) -> None:
     cfg = _load_yaml(config_path)
     device = _resolve_device(cfg["RUNTIME"]["DEVICE"])
@@ -277,13 +379,27 @@ def eval(config_path: str) -> None:
     ])
 
     splits = ["train", "val"]
-    loaders = {
+    gt_loaders = {
         split: build_voc_dataloader(
             dataset_name=cfg["DATA"]["DATASET_NAME"],
             split=split,
             target_mode="gt",
             batch_size=cfg["DATA"]["BATCH_SIZE"],
             transforms=transform,
+        )
+        for split in splits
+    }
+    bg_batch_size = int(cfg["EVAL"].get("BG_BATCH_SIZE", cfg["DATA"]["BATCH_SIZE"]))
+    if bg_batch_size <= 0:
+        raise ValueError("EVAL.BG_BATCH_SIZE 必须为正整数。")
+    bg_loaders = {
+        split: build_voc_dataloader(
+            dataset_name=cfg["DATA"]["DATASET_NAME"],
+            split=split,
+            target_mode="gt",
+            batch_size=bg_batch_size,
+            transforms=transform,
+            use_bg_boxes=True,
         )
         for split in splits
     }
@@ -302,18 +418,34 @@ def eval(config_path: str) -> None:
     save_dir = Path("results") / "proto_eval" / start_time
     num_classes_with_bg = cfg["DATA"]["NUM_CLASSES"] + 1
 
-    print("\n-----Prototype Similarity & Margin Evaluation Results-----")
-    for split, loader in loaders.items():
-        mean_pos, cnt, csv_path, out_dir = _evaluate_similarity_and_margin(
+    print("\n-----GT Box Prototype Similarity & Margin Evaluation Results-----")
+    for split, loader in gt_loaders.items():
+        mean_pos, cnt, csv_path, out_dir = _evaluate_gt_similarity_and_margin(
             model=model,
             loader=loader,
             prototypes=prototypes,
             num_classes_with_bg=num_classes_with_bg,
             device=device,
-            save_dir=save_dir,
+            save_dir=save_dir / "gt",
             split_name=split,
         )
-        print(f"{split}: mean_pos={mean_pos}, cnt={cnt}, csv={csv_path}, dir={out_dir}")
+        print(f"{split} GT: mean_pos={mean_pos}, cnt={cnt}, csv={csv_path}, dir={out_dir}")
+
+    print("\n-----Background Box Positive Similarity Evaluation Results-----")
+    for split, loader in bg_loaders.items():
+        mean_pos, cnt, csv_path, out_dir = _evaluate_bg_positive_similarity(
+            model=model,
+            loader=loader,
+            prototypes=prototypes,
+            num_classes_with_bg=num_classes_with_bg,
+            device=device,
+            save_dir=save_dir / "bg",
+            split_name=split,
+        )
+        print(
+            f"{split} BG: mean_pos={mean_pos}, cnt={cnt}, "
+            f"csv={csv_path}, dir={out_dir}"
+        )
 
 
 def main():
