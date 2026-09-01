@@ -188,7 +188,7 @@ class PrototypeBuilderTrainer:
 
         epoch_losses = {
             'total' : 0.0,
-            'cam' : 0.0,
+            'ccam' : 0.0,
             'constrain' : 0.0,
             'constrain_supcon' : 0.0,
             'constrain_proto' : 0.0,
@@ -250,7 +250,7 @@ class PrototypeBuilderTrainer:
                 valid_fg_class_ids=valid_class_ids,
             )
 
-            loss = (self.cfg.w_cam_loss * out['loss_cam'] +
+            loss = (self.cfg.w_ccam_loss * out['loss_ccam'] +
                     self.cfg.w_constrain_loss * loss_constrain_dict['loss_constrain'] +
                     self.cfg.w_sep_loss * loss_sep_dict['loss_sep'])
 
@@ -266,7 +266,7 @@ class PrototypeBuilderTrainer:
             self.optimizer.step()
 
             epoch_losses['total'] += loss.item()
-            epoch_losses['cam'] += out['loss_cam'].item()
+            epoch_losses['ccam'] += out['loss_ccam'].item()
             epoch_losses['constrain'] += loss_constrain_dict['loss_constrain'].item()
             epoch_losses['constrain_supcon'] += loss_constrain_dict['loss_constrain_supcon'].item()
             epoch_losses['constrain_proto'] += loss_constrain_dict['loss_constrain_proto'].item()
@@ -276,15 +276,15 @@ class PrototypeBuilderTrainer:
 
             pbar.set_postfix({
                 "Iter Loss: Total": f"{loss.item():.4f} ",
-                "CAM": f"{out['loss_cam'].item():.4f} ",
+                "CCAM": f"{out['loss_ccam'].item():.4f} ",
                 "Constrain": f"{loss_constrain_dict['loss_constrain'].item():.4f} ",
                 "Sep": f"{loss_sep_dict['loss_sep'].item():.4f} ",
                 "lr": f"{self.optimizer.param_groups[0]['lr']}",
             })
 
-            # # debug: visualize CAMs
+            # # debug: visualize CCAMs
             # visualize_cams(
-            #     cams=self.model.mp_generator.cams,
+            #     ccams=out['ccams'],
             #     targets=targets,
             #     wb_one_hot_labels=wb_one_hot_labels,
             #     canvas_sizes=[
@@ -300,7 +300,7 @@ class PrototypeBuilderTrainer:
 
         num_iters = len(self.train_loader)
         average_total_loss = epoch_losses['total'] / num_iters
-        average_cam_loss = epoch_losses['cam'] / num_iters
+        average_ccam_loss = epoch_losses['ccam'] / num_iters
         average_constrain_loss = epoch_losses['constrain'] / num_iters
         average_constrain_supcon_loss = epoch_losses['constrain_supcon'] / num_iters
         average_constrain_proto_loss = epoch_losses['constrain_proto'] / num_iters
@@ -311,7 +311,7 @@ class PrototypeBuilderTrainer:
         self.logger.add_info(
             f"Epoch [{epoch}/{self.cfg.epochs}]\n"
             f"  Total Loss: {average_total_loss:.4f} | "
-            f"CAM Loss: {average_cam_loss:.4f}\n"
+            f"CCAM Loss: {average_ccam_loss:.4f}\n"
             f"  Constrain Loss: {average_constrain_loss:.4f} | "
             f"SupCon Loss: {average_constrain_supcon_loss:.4f} | "
             f"Proto Loss: {average_constrain_proto_loss:.4f}\n"
@@ -322,7 +322,7 @@ class PrototypeBuilderTrainer:
         metrics = {
             'Epoch': epoch,
             'Total Loss': average_total_loss,
-            'CAM Loss': average_cam_loss,
+            'CCAM Loss': average_ccam_loss,
             'Constrain Loss': average_constrain_loss,
             'Constrain SupCon Loss': average_constrain_supcon_loss,
             'Constrain Proto Loss': average_constrain_proto_loss,

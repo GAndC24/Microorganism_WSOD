@@ -1,5 +1,6 @@
 # Prototype Builder, only construct morphological prototypes
 from collections import OrderedDict
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,6 +12,7 @@ from torchvision.models import vgg16
 from torchvision.transforms import v2 as T
 
 from .configs.cfg_prototype_builder import PrototypeBuilderConfig, build_prototype_builder_config
+from ..utils.losses.ccam_loss import SimMaxLoss, SimMinLoss
 
 
 # -----Feature Hook-----
@@ -74,45 +76,6 @@ def build_vgg16_backbone_with_hook(indices : List[int]) -> Tuple[nn.Module, Feat
     return backbone, hook
 
 
-# -----Class Activation Map Head-----
-# generate CAMs and compute CAM loss
-class CAMHead(nn.Module):
-    def __init__(
-        self,
-        num_classes: int, # number of classes
-        in_channels: int  # input channels
-    )-> None:
-        super(CAMHead, self).__init__()
-
-        self.num_classes = num_classes
-
-        self.CE_loss = nn.CrossEntropyLoss()
-        self.cam_conv = nn.Conv2d(in_channels, num_classes, kernel_size=1, bias=False)
-
-        weight_init.c2_msra_fill(self.cam_conv)
-
-    def forward(self, x : torch.Tensor, y : torch.Tensor)-> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        :param x: RoI feature maps, [R, C, H, W]
-        :param y: weak box labels, [R, num_classes]
-        :return:
-        - CAMs, [R, num_classes, H, W]
-        - CAM loss, {loss_name: loss}
-        """
-        # get CAMs
-        x = self.cam_conv(x)
-
-        # get class logits
-        logits = F.avg_pool2d(x, (x.size(2), x.size(3)))
-        logits = logits.view(-1, self.num_classes)
-
-        # compute CE Loss
-        target = torch.argmax(y, dim=1)
-        loss_cam = self.CE_loss(logits, target)
-
-        return x, loss_cam
-
-
 # -----Feature Augmentation Transform-----
 class FeatureMapTransform(nn.Module):
     def __init__(
@@ -122,7 +85,7 @@ class FeatureMapTransform(nn.Module):
         mask_scale: Tuple[float, float] = (0.02, 0.20),
         noise_prob: float = 0.5,
         noise_sigma: float = 0.05,
-        keep_original: bool = True,
+        keep_original: bool = False,
     ) -> None:
         super().__init__()
         self.num_views = num_views
@@ -163,6 +126,54 @@ class FeatureMapTransform(nn.Module):
         return torch.stack(views, dim=1)
 
 
+# -----CCAM Generator-----
+class CCAMGenerator(nn.Module):
+    def __init__(
+        self,
+        in_c : int,     # input channels
+        alpha : float = 0.05
+    )-> None:
+        super(CCAMGenerator, self).__init__()
+
+        self.activation_head = nn.Conv2d(in_c, 1, kernel_size=3, padding=1, bias=False)
+        self.bn_head = nn.BatchNorm2d(1)
+        self.criterion = [
+            SimMaxLoss(metric='cos', alpha=alpha), # BG-BG positive contrast
+            SimMinLoss(metric='cos'),   # BG-FG negative contrast
+            SimMaxLoss(metric='cos', alpha=alpha)   # FG-FG positive contrast
+        ]
+
+
+    def forward(
+        self,
+        x : torch.Tensor    # input feature maps, [N, C, H, W]
+    )-> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        :return:
+            ccam(torch.Tensor): class activation map, [N, 1, H, W]
+            loss_ccam(torch.Tensor): CCAM loss
+        """
+        N, C, H, W = x.size()
+
+        ccam = torch.sigmoid(self.bn_head(self.activation_head(x)))
+        ccam_ = ccam.reshape(N, 1, H * W)                          # [N, 1, H*W]
+
+        x = x.reshape(N, C, H * W).permute(0, 2, 1).contiguous()   # [N, H*W, C]
+        fg_feats = torch.matmul(ccam_, x) / (H * W)                # [N, 1, C]
+        bg_feats = torch.matmul(1 - ccam_, x) / (H * W)            # [N, 1, C]
+        fg_feats = fg_feats.reshape(x.size(0), -1)      # [N, C]
+        bg_feats = bg_feats.reshape(x.size(0), -1)      # [N, C]
+        for loss in self.criterion:
+            loss.to(x.device)
+
+        loss_bg_bg = self.criterion[0](bg_feats)
+        loss_bg_fg = self.criterion[1](bg_feats, fg_feats)
+        loss_fg_fg = self.criterion[2](fg_feats)
+        loss_ccam = loss_bg_bg + loss_bg_fg + loss_fg_fg
+
+        return ccam, loss_ccam
+
+
 # -----Morphological Prototype Generator-----
 class MorphologicalPrototypeGenerator(nn.Module):
     def __init__(
@@ -193,10 +204,7 @@ class MorphologicalPrototypeGenerator(nn.Module):
             aligned=aligned,
         )
 
-        self.cam_head = CAMHead(
-            num_classes=num_classes,
-            in_channels=in_c,
-        )
+        self.ccam_generator = CCAMGenerator(in_c=in_c)
 
         self.patch_embed = PatchEmbed(
             img_size=roi_out_size,
@@ -217,36 +225,44 @@ class MorphologicalPrototypeGenerator(nn.Module):
         self.gap_bg = nn.AdaptiveAvgPool2d((1, 1))
 
 
-    def _cam_to_patch_fg_bg_scores(self, cams : torch.Tensor,wb_labels : torch.Tensor)-> torch.Tensor:
+    def _get_patch_scores(
+        self,
+        ccams: torch.Tensor,    # [R * V, 1, H, W]
+    )->torch.Tensor:
         """
-        :param cams: CAMs, [R, K = num_classes, H, W]
-        :param wb_labels: weak box labels, [R, K = num_classes]
-        :return: patch_fg_bg_scores : fg/bg scores for each patch, [R, Np = num_patches, 2]
+        :return:
+            patch_scores(torch.Tensor): fg and bg scores for each patch, [R * V, Np = num_patches, 2],
+                                        patch_scores[:, :, 0] = fg_scores, patch_scores[:, :, 1] = bg_scores
         """
+        if ccams.ndim != 4:
+            raise ValueError(
+                f"ccams 应为四维张量 [R * V, 1, H, W]，实际形状为 {tuple(ccams.shape)}"
+            )
 
-        R, K, H, W = cams.shape
-        assert H % self.patch_size == 0 and W % self.patch_size == 0, "RoI output size must be divisible by patch_size"
+        _, channels, height, width = ccams.shape
+        if channels != 1:
+            raise ValueError(f"ccams 的通道数必须为 1，实际为 {channels}")
 
-        # get class ids for each weak box
-        cls_ids = torch.argmax(wb_labels, dim=1)  # [R]
+        if height % self.patch_size != 0 or width % self.patch_size != 0:
+            raise ValueError(
+                "CCAM 的空间尺寸必须能够被 patch_size 整除，"
+                f"实际尺寸为 ({height}, {width})，patch_size={self.patch_size}"
+            )
 
-        # gather class-specific CAM: [R, H, W]
-        cam_cls = cams[torch.arange(R, device=cams.device), cls_ids]  # [R, H, W]
-
-        # get probability maps from CAMs
-        cam_prob = torch.sigmoid(cam_cls).unsqueeze(1)  # [R, 1, H, W]
-
-        fg_map = F.avg_pool2d(
-            cam_prob,
+        # 使用与 PatchEmbed 相同的窗口和步长，计算每个 patch 的平均前景响应
+        fg_scores = F.avg_pool2d(
+            ccams,
             kernel_size=self.patch_size,
-            stride=self.patch_size
-        )       # [R, 1, Hp, Wp]
-        fg_score = fg_map.flatten(1)        # [R, N]
-        bg_score = 1 - fg_score     # [R, N]
+            stride=self.patch_size,
+        ).flatten(start_dim=1)  # [R * V, Np]
 
-        patch_fg_bg_scores = torch.stack([fg_score, bg_score], dim=-1)  # [R, Np, 2]
+        bg_scores = 1.0 - fg_scores
+        patch_scores = torch.stack(
+            (fg_scores, bg_scores),
+            dim=-1,
+        )  # [R * V, Np, 2]
 
-        return patch_fg_bg_scores
+        return patch_scores
 
 
     def _get_anchor_features(
@@ -254,21 +270,45 @@ class MorphologicalPrototypeGenerator(nn.Module):
         patch_features : torch.Tensor,      # [Np, D]
         patch_fg_bg_scores : torch.Tensor,  # [Np, 2]
         lse_alpha: float = 10.0,
+        topk_ratio: float = 0.2,
     )->torch.Tensor:
         """
-        :return: anchor_feature: the anchor feature of weak box, [D]
+        根据前景分数最高的 top-k patch 计算弱框的 anchor 特征。
+
+        :param topk_ratio: 保留 patch 的比例，取值范围为 (0, 1]
+        :return: anchor_feature，形状为 [D]
         """
         eps = 1e-6
         alpha = float(lse_alpha)
 
-        patch_features_norm = F.normalize(patch_features, dim=-1, eps=eps)
+        if not 0.0 < topk_ratio <= 1.0:
+            raise ValueError(f"topk_ratio 必须位于 (0, 1]，当前值为 {topk_ratio}")
 
-        fg_scores = patch_fg_bg_scores[:, 0].clamp_min(eps)
-        fg_weights = fg_scores / (fg_scores.sum(dim=0, keepdim=True) + eps)
+        num_patches = patch_features.shape[0]
+        if num_patches == 0:
+            raise ValueError("patch_features 不能为空")
+        if patch_fg_bg_scores.shape[0] != num_patches:
+            raise ValueError("patch_features 与 patch_fg_bg_scores 的 patch 数量不一致")
 
-        weighted_logits = alpha * patch_features_norm + torch.log(fg_weights).unsqueeze(-1)
+        topk_count = max(1, math.ceil(num_patches * topk_ratio))
+        all_fg_scores = patch_fg_bg_scores[:, 0]
+        topk_indices = torch.topk(
+            all_fg_scores,
+            k=topk_count,
+            largest=True,
+            sorted=False,
+        ).indices
+
+        selected_features = patch_features.index_select(0, topk_indices)
+        selected_fg_scores = all_fg_scores.index_select(0, topk_indices).clamp_min(eps)
+
+        fg_weights = selected_fg_scores / (
+            selected_fg_scores.sum(dim=0, keepdim=True) + eps
+        )
+
+        weighted_logits = alpha * selected_features + torch.log(fg_weights).unsqueeze(-1)
         anchor_feature = torch.logsumexp(weighted_logits, dim=0) / alpha
-        anchor_feature = F.normalize(anchor_feature, dim=-1, eps=eps)
+        # anchor_feature = F.normalize(anchor_feature, dim=-1, eps=eps)
 
         return anchor_feature
 
@@ -279,7 +319,6 @@ class MorphologicalPrototypeGenerator(nn.Module):
         weights : torch.Tensor,    # [R, Np]
         wb_labels : torch.Tensor,       # [R, num_classes]
         eps: float = 1e-6,
-        normalize_proto: bool = False
     )-> Dict[int, torch.Tensor]:
         """
         :return: prototypes, {class_id in [1, num_classes]: prototype tensor}
@@ -292,8 +331,6 @@ class MorphologicalPrototypeGenerator(nn.Module):
         denom = (y_ * w_).sum(dim=(0, 2))  # [num_classes, 1]
 
         prototypes = numerator / (denom + eps)  # [num_classes, D]
-        if normalize_proto:
-            prototypes = F.normalize(prototypes, dim=-1)
 
         proto_dict : Dict[int, torch.Tensor] = {}
         for class_id in range(1, self.num_classes + 1):
@@ -306,7 +343,8 @@ class MorphologicalPrototypeGenerator(nn.Module):
         self,
         patch_features : torch.Tensor,      # [R, Np, D]
         patch_fg_bg_scores : torch.Tensor,  # [R, Np, 2]
-        top_k_ratio : float = 0.05,
+        top_k_ratio : float = 0.2,
+        lse_alpha : float = 10.0,
     )-> torch.Tensor:
         '''
         Return:
@@ -319,8 +357,9 @@ class MorphologicalPrototypeGenerator(nn.Module):
         bg_patch_features = patch_features.gather(1, top_k_indices.unsqueeze(-1).expand(-1, -1, patch_features.shape[-1]))  # [R, k, D]
         R, k, D = bg_patch_features.shape
         bg_patch_features = bg_patch_features.reshape(R * k, D)  # [R * k, D]
-        # Compute the mean of the selected background patch features
-        bg_prototype = bg_patch_features.mean(dim=0)  # [D]
+        # Compute the LogSumExp of the selected background patch features
+        bg_patch_features = lse_alpha * bg_patch_features  # [R * k, D]
+        bg_prototype = torch.logsumexp(bg_patch_features, dim=0) / lse_alpha  # [D]
 
         return bg_prototype
 
@@ -329,13 +368,13 @@ class MorphologicalPrototypeGenerator(nn.Module):
         self,
         x : torch.Tensor,       # middle feature maps, [B, C2, H2, W2]
         wboxes : torch.Tensor,    # weak boxes, [R=num_wbs, 5], for each box, [batch_idx, x1, y1, x2, y2]
-        wb_labels : torch.Tensor,    # class label for weak boxes, [R, num_classes]
+        wb_labels: torch.Tensor,  # class label for weak boxes, [R, num_classes]
         lse_alpha : float = 10.0    # LSE alpha = 1 / tau, inverse temperature
     )-> Dict[str, Any]:
         """
         :return:
         out, Dict[str, Any], contains:
-        - 'loss_cam': torch.Tensor, CAM loss
+        - 'loss_ccam': torch.Tensor, CCAM loss
         - 'prototypes': Dict[int, torch.Tensor], {class_id in [0, num_classes](0 for background) : prototype_embeddings}
         - 'contrast_patch_features': torch.Tensor, patch features for SupCon, shape [R, V=num_views, D]
         """
@@ -343,18 +382,17 @@ class MorphologicalPrototypeGenerator(nn.Module):
         # -----get aug weak box features & background features-----
         # aug weak box features
         roi_features = self.roi_align(x, wboxes)       # [R, C, H, W]
-        # aug_roi_features = self.feature_transform(roi_features.detach())  # [R, V, C, H, W]
         aug_roi_features = self.feature_transform(roi_features)  # [R, V, C, H, W]
 
 
-        # -----get CAMs-----
+        # -----get CCAMs-----
         R, V, C, H, W = aug_roi_features.shape
         RV = R * V
-        expand_wb_labels = wb_labels.unsqueeze(1).expand(-1, V, -1).reshape(RV, -1)  # [R * V, num_classes]
         aug_roi_features = aug_roi_features.reshape(RV, C, H, W)    # [R * V, C, H, W]
-        cams, loss_cam = self.cam_head(aug_roi_features, expand_wb_labels)        # cams, [R * V, num_classes, H, W]
+        ccams, loss_ccam = self.ccam_generator(aug_roi_features)        # ccams of shape [R * V, 1, H, W]
         out.update({
-            'loss_cam' : loss_cam,
+            'loss_ccam' : loss_ccam,
+            'ccams' : ccams,
         })
 
 
@@ -379,7 +417,17 @@ class MorphologicalPrototypeGenerator(nn.Module):
 
         # -----get morphological prototypes-----
         # get fg & bg scores for each patch
-        patch_fg_bg_scores = self._cam_to_patch_fg_bg_scores(cams, expand_wb_labels)      # [R * V, Np, 2], fg_scores = [:, :, 0], bg_scores = [:, :, 1]
+        patch_fg_bg_scores = self._get_patch_scores(ccams)      # [R * V, Np, 2], fg_scores = [:, :, 0], bg_scores = [:, :, 1]
+
+        # # debug: record the patch scores
+        # with open("debug/debug.txt", 'a') as f:
+        #     f.write("patch_fg_bg_scores:\n")
+        #     for idx, s in enumerate(patch_fg_bg_scores):
+        #         f.write(f"wbox {idx}:\n")
+        #         for s_i in s:
+        #             f.write(f"fg: {s_i[0]}, bg: {s_i[1]}\n")
+        #         f.write("\n")
+
         # build background prototype
         bg_prototype = self._get_background_prototype(patch_features, patch_fg_bg_scores)  # [D]
         # get anchor feature of each weak box
@@ -397,7 +445,8 @@ class MorphologicalPrototypeGenerator(nn.Module):
         weights = F.relu(weights)  # remove negative value
         weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)  # normalize, sum to 1
         # prototypes: Dict[int, torch.Tensor], {class_id in [1, num_classes] : prototype tensor}
-        prototypes = self._get_morphological_prototypes(patch_features_norm, weights, expand_wb_labels)
+        expand_wb_labels = wb_labels.unsqueeze(1).expand(-1, V, -1).reshape(RV, -1)  # [R * V, num_classes]
+        prototypes = self._get_morphological_prototypes(patch_features, weights, expand_wb_labels)
         prototypes = {
             0: bg_prototype,
             **prototypes,
@@ -498,16 +547,15 @@ class ProtypeBuilder(nn.Module):
 
         for i in range(R):
             box_patch = patch_features[i]  # [num_patches, D]
-            box_patch = F.normalize(box_patch, dim=1)
 
             # # mean pooling
             # box_vec = box_patch.mean(dim=0, keepdim=True)  # [1, D]
             # box_vec = F.normalize(box_vec, dim=1)  # [1, D]
 
             # LogSumExp pooling
-            m = box_patch.max(dim=0, keepdim=True).values  # [1, D]
-            lse = m + torch.log(torch.exp(lse_alpha * (box_patch - m)).mean(dim=0, keepdim=True) + lse_eps) / lse_alpha
-            box_vec = F.normalize(lse, dim=1, eps=lse_eps)  # [1, D]
+            box_patch = box_patch * lse_alpha  # [num_patches, D]
+            box_lse = torch.logsumexp(box_patch, dim=0, keepdim=True) / lse_alpha
+            box_vec = F.normalize(box_lse, dim=1, eps=lse_eps)  # [1, D]
 
             if positive_only:
                 sims_all = torch.matmul(box_vec, proto_mat.t()).squeeze(0)
@@ -580,7 +628,8 @@ class ProtypeBuilder(nn.Module):
         """
         :return:
         out: Dict[str, Any], contains:
-        - 'loss_cam': Tensor, CAM loss
+        - 'loss_ccam': Tensor, CCAM loss
+        - 'ccams': Tensor, CCAM 概率图，形状为 [R * V, 1, H, W]
         - 'prototypes': Dict[int, torch.Tensor], {class_id in [0, num_classes](0 for background) : prototype_embeddings}
         - 'contrast_patch_features': torch.Tensor, patch features for SupCon, shape [R, V=num_views, D]
         """
@@ -616,7 +665,8 @@ class ProtypeBuilder(nn.Module):
             prototypes_dict[key] = prototypes[idx]
 
         out.update({
-            'loss_cam' : mp_g_out['loss_cam'],
+            'loss_ccam' : mp_g_out['loss_ccam'],
+            'ccams' : mp_g_out['ccams'],
             'prototypes' : prototypes_dict,
             'contrast_patch_features' : contrast_patch_features,
         })

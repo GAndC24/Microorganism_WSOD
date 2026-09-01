@@ -1,4 +1,4 @@
-"将弱框对应的类别激活图投影到原图并保存。"
+"将弱框对应的单通道 CCAM 投影到原图并保存。"
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from .vis_boxes import _clip_box, _draw_labeled_box, _read_gt_boxes, _resolve_sa
 _OUTPUT_ROOT = Path(__file__).resolve().parents[2] / 'debug' / 'vis_cams'
 _GT_COLOR = (40, 210, 80)
 _WEAK_BOX_COLOR = (0, 220, 255)
-_CAM_ALPHA = 0.6
+_CCAM_ALPHA = 0.6
 
 
 def _collect_target_boxes(
@@ -45,28 +45,30 @@ def _collect_target_boxes(
 
 
 def _validate_inputs(
-    cams: torch.Tensor,
+    ccams: torch.Tensor,
     num_weak_boxes: int,
     wb_one_hot_labels: torch.Tensor,
 ) -> tuple[int, int]:
-    """校验输入，并返回弱框数和每个弱框的 CAM 视图数。"""
-    if not isinstance(cams, torch.Tensor) or cams.ndim != 4:
-        raise ValueError("cams 必须是形状为 [R * V, K, H, W] 的 Tensor")
+    """校验输入，并返回弱框数和每个弱框的 CCAM 视图数。"""
+    if not isinstance(ccams, torch.Tensor) or ccams.ndim != 4:
+        raise ValueError("ccams 必须是形状为 [R * V, 1, H, W] 的 Tensor")
+    if ccams.shape[1] != 1:
+        raise ValueError(f"CCAM 必须是单通道，实际通道数为 {ccams.shape[1]}")
     if not isinstance(wb_one_hot_labels, torch.Tensor) or wb_one_hot_labels.ndim != 2:
         raise ValueError("wb_one_hot_labels 必须是形状为 [R, K] 的 Tensor")
 
     if wb_one_hot_labels.shape[0] != num_weak_boxes:
         raise ValueError("targets 中的 boxes 与 wb_one_hot_labels 的弱框数量不一致")
-    if cams.shape[1] != wb_one_hot_labels.shape[1]:
-        raise ValueError("cams 与 wb_one_hot_labels 的类别数量不一致")
     if num_weak_boxes == 0:
+        if ccams.shape[0] != 0:
+            raise ValueError("没有弱框时，ccams 的首维也必须为 0")
         return 0, 0
-    if cams.shape[0] % num_weak_boxes != 0:
-        raise ValueError("cams 的首维必须是弱框数量 R 的整数倍")
-    if cams.shape[2] <= 0 or cams.shape[3] <= 0:
-        raise ValueError("CAM 的空间尺寸必须大于 0")
+    if ccams.shape[0] % num_weak_boxes != 0:
+        raise ValueError("ccams 的首维必须是弱框数量 R 的整数倍")
+    if ccams.shape[2] <= 0 or ccams.shape[3] <= 0:
+        raise ValueError("CCAM 的空间尺寸必须大于 0")
 
-    return num_weak_boxes, int(cams.shape[0] // num_weak_boxes)
+    return num_weak_boxes, int(ccams.shape[0] // num_weak_boxes)
 
 
 def _validate_canvas_sizes(
@@ -117,19 +119,15 @@ def _prepare_visualization_canvas(
     return image, scaled_gt_boxes
 
 
-def _normalize_cam(cam: torch.Tensor) -> torch.Tensor:
-    """将 CAM logits 转为稳定的 [0, 1] 可视化强度。"""
-    probability = torch.sigmoid(cam.detach().float().cpu())
+def _prepare_ccam(ccam: torch.Tensor) -> torch.Tensor:
+    """将模型输出的 CCAM 概率转换为稳定的 [0, 1] 可视化强度。"""
+    probability = ccam.detach().float().cpu()
     probability = torch.nan_to_num(probability, nan=0.0, posinf=1.0, neginf=0.0)
-    minimum = probability.min()
-    maximum = probability.max()
-    if float(maximum - minimum) <= torch.finfo(probability.dtype).eps:
-        return torch.zeros_like(probability)
-    return ((probability - minimum) / (maximum - minimum)).clamp(0.0, 1.0)
+    return probability.clamp(0.0, 1.0)
 
 
 def _cam_to_heatmap(cam: torch.Tensor) -> Image.Image:
-    """使用无额外依赖的 Jet 色表将单通道 CAM 转为 RGB 图。"""
+    """使用无额外依赖的 Jet 色表将单通道 CCAM 转为 RGB 图。"""
     value = cam.clamp(0.0, 1.0)
     red = (1.5 - torch.abs(4.0 * value - 3.0)).clamp(0.0, 1.0)
     green = (1.5 - torch.abs(4.0 * value - 2.0)).clamp(0.0, 1.0)
@@ -138,12 +136,12 @@ def _cam_to_heatmap(cam: torch.Tensor) -> Image.Image:
     return Image.fromarray(rgb, mode="RGB")
 
 
-def _overlay_cam(
+def _overlay_ccam(
     image: Image.Image,
-    cam: torch.Tensor,
+    ccam: torch.Tensor,
     weak_box: tuple[float, float, float, float],
 ) -> None:
-    """仅在弱框内部叠加 CAM，避免把 ROI 激活错误扩散到整张图。"""
+    """仅在弱框内部叠加 CCAM，避免把 ROI 激活错误扩散到整张图。"""
     image_width, image_height = image.size
     clipped_box = _clip_box(weak_box, image_width, image_height)
     if clipped_box is None:
@@ -158,10 +156,10 @@ def _overlay_cam(
         return
 
     region_size = (right - left, bottom - top)
-    normalized_cam = _normalize_cam(cam)
-    heatmap = _cam_to_heatmap(normalized_cam).resize(region_size, Image.Resampling.BILINEAR)
+    prepared_ccam = _prepare_ccam(ccam)
+    heatmap = _cam_to_heatmap(prepared_ccam).resize(region_size, Image.Resampling.BILINEAR)
     alpha = Image.fromarray(
-        normalized_cam.mul(255 * _CAM_ALPHA).byte().numpy(),
+        prepared_ccam.mul(255 * _CCAM_ALPHA).byte().numpy(),
         mode="L",
     ).resize(region_size, Image.Resampling.BILINEAR)
     image_region = image.crop((left, top, right, bottom))
@@ -175,7 +173,7 @@ def _draw_annotations(
         tuple[int, tuple[float, float, float, float], int]
     ],
 ) -> None:
-    """在 CAM 之上绘制全部 GT 框、弱框和图例。"""
+    """在 CCAM 之上绘制全部 GT 框、弱框和图例。"""
     image_width, image_height = image.size
     line_width = max(2, round(min(image_width, image_height) / 250))
     draw = ImageDraw.Draw(image)
@@ -202,18 +200,18 @@ def _draw_annotations(
                 label=f"Weak {weak_box_index}: class {class_id}",
             )
 
-    legend = "CAM    Weak box    GT"
+    legend = "CCAM    Weak box    GT"
     text_box = draw.textbbox((6, 6), legend)
     draw.rectangle((3, 3, text_box[2] + 9, text_box[3] + 9), fill=(0, 0, 0))
-    draw.text((6, 6), "CAM", fill=(255, 80, 40))
-    weak_x = 6 + draw.textlength("CAM    ")
+    draw.text((6, 6), "CCAM", fill=(255, 80, 40))
+    weak_x = 6 + draw.textlength("CCAM    ")
     draw.text((weak_x, 6), "Weak box", fill=_WEAK_BOX_COLOR)
-    gt_x = 6 + draw.textlength("CAM    Weak box    ")
+    gt_x = 6 + draw.textlength("CCAM    Weak box    ")
     draw.text((gt_x, 6), "GT", fill=_GT_COLOR)
 
 
 def visualize_cams(
-    cams: torch.Tensor,
+    ccams: torch.Tensor,
     targets: Sequence[Mapping[str, Any]],
     wb_one_hot_labels: torch.Tensor,
     canvas_sizes: Sequence[tuple[int, int]],
@@ -221,20 +219,21 @@ def visualize_cams(
     iter: int,
 ) -> list[Path]:
     """
-    按图片可视化一个 batch 内全部弱框的类别 CAM。
+    按图片可视化一个 batch 内全部弱框的单通道 CCAM。
 
-    ``cams`` 可以是 ``[R, K, H, W]``，也可以是包含增强视图的
-    ``[R * V, K, H, W]``。后者按模型的排列规则还原成 ``[R, V, ...]``，
+    ``ccams`` 可以是 ``[R, 1, H, W]``，也可以是包含增强视图的
+    ``[R * V, 1, H, W]``。后者按模型的排列规则还原成 ``[R, V, ...]``，
     并使用第 0 个未增强视图。每个输出文件对应一张图片，包含训练画布图像、
-    全部 GT 框、全部弱框，以及投影在各自弱框内部的类别 CAM。
+    全部 GT 框、全部弱框，以及投影在各自弱框内部的 CCAM。
 
     弱框直接取自 ``targets[*]['boxes']``，展开顺序与训练时构造标签的顺序一致。
+    ``wb_one_hot_labels`` 仅用于标注弱框类别，不用于选择 CCAM 通道。
     ``canvas_sizes`` 必须按 batch 顺序显式提供每张训练图像的 ``(高, 宽)``。
     """
     validated_canvas_sizes = _validate_canvas_sizes(canvas_sizes, len(targets))
     boxes_cpu, box_batch_indices = _collect_target_boxes(targets)
     num_weak_boxes, num_views = _validate_inputs(
-        cams,
+        ccams,
         int(boxes_cpu.shape[0]),
         wb_one_hot_labels,
     )
@@ -249,12 +248,12 @@ def visualize_cams(
     if epoch_index < 0 or iter_index < 0:
         raise ValueError("epoch 和 iter 不能为负数")
 
-    cams_by_box = cams.detach().reshape(
+    ccams_by_box = ccams.detach().reshape(
         num_weak_boxes,
         num_views,
-        cams.shape[1],
-        cams.shape[2],
-        cams.shape[3],
+        1,
+        ccams.shape[2],
+        ccams.shape[3],
     )[:, 0].cpu()
     class_ids = wb_one_hot_labels.detach().argmax(dim=1).cpu()
 
@@ -295,9 +294,9 @@ def visualize_cams(
         for weak_box_index in weak_box_indices:
             weak_box = tuple(float(value) for value in boxes_cpu[weak_box_index])
             class_id = int(class_ids[weak_box_index].item())
-            class_cam = cams_by_box[weak_box_index, class_id]
+            ccam = ccams_by_box[weak_box_index, 0]
 
-            _overlay_cam(image, class_cam, weak_box)
+            _overlay_ccam(image, ccam, weak_box)
             annotations.append((weak_box_index, weak_box, class_id))
 
         _draw_annotations(image, gt_boxes, annotations)
